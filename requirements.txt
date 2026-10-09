@@ -37,6 +37,8 @@ networkx==3.1
 numba==0.59.1
 numpy==1.24.4
 openai
+litellm
+lab_llm @ git+https://github.com/jjfenglab/llm-api.git@efda8bb393a851a207c22fd64411f6403d3beadc
 packaging==23.2
 pandas==2.1.1
 Pillow==10.0.1

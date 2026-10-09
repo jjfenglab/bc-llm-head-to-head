@@ -26,13 +26,7 @@ from src.utils import convert_to_json
 from src.llm_response_types import ProtoConceptExtract
 import src.common as common
 
-sys.path.append('llm-api-main')
-from lab_llm.constants import LLMModel, OpenAi, convert_to_llm_type
-from lab_llm.llm_api import LLMApi
-from lab_llm.llm_cache import LLMCache
-from lab_llm.duckdb_handler import DuckDBHandler
-from lab_llm.error_callback_handler import ErrorCallbackHandler
-from lab_llm.dataset import TextDataset, ImageDataset
+from src.llm_utils import LLMApi, TextDataset, ImageDataset
 
 
 def parse_args(args):
@@ -102,12 +96,10 @@ def main(args):
         for k, v in config_dict.items():
             prompt_template = prompt_template.replace(k, v)
     
-    # Setup LLM cache + API
+    # Setup LLM
     logger = logging.getLogger(__name__)
     load_dotenv()
-    args.cache = LLMCache(DuckDBHandler(args.cache_file))
-    args.llm_model_type = convert_to_llm_type(args.llm_model_type)
-    llm = LLMApi(args.cache, seed=10, model_type=args.llm_model_type, error_handler=ErrorCallbackHandler(logger), logging=logging)
+    llm = LLMApi(args.llm_model_type, cache_file=args.cache_file, logger=logger)
 
     if args.batch_obs_size > 1:
         # Get outputs grouped

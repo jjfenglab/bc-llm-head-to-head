@@ -16,10 +16,9 @@ from typing import List, Optional
 from sklearn.metrics import roc_auc_score
 from sklearn.linear_model import LogisticRegression
 from scipy.stats import multivariate_normal
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GroupShuffleSplit
 
-sys.path.append('llm-api-main')
-from lab_llm.llm_api import LLMApi
+from src.llm_utils import LLMApi
 from src.utils import convert_to_json, convert_to_list_of_jsons
 from src.training_history import TrainingHistory
 import src.common as common
@@ -71,7 +70,8 @@ class ConceptLearnerModel:
             max_new_tokens: int = 5000,
             num_top: int = 40,
             num_minibatch: int = None,
-            is_greedy_metric_acc: bool = False
+            is_greedy_metric_acc: bool = False,
+            cluster_column: Optional[str] = None,
             ):
         self.init_history = init_history
         self.llm_iter = llm_iter
@@ -105,6 +105,7 @@ class ConceptLearnerModel:
         self.num_top = num_top
         self.batch_concept_size = batch_concept_size
         self.final_learner_type = final_learner_type
+        self.cluster_column = cluster_column
 
         assert self.num_minibatch is None
         assert self.num_meta_concepts % self.num_greedy_holdout == 0
@@ -146,9 +147,23 @@ class ConceptLearnerModel:
                     max_section_length=self.max_section_length,
                 )
 
-                # randomly pick portion of data for generating LLM prior
+                # randomly pick portion of data for generating LLM prior.
+                # If cluster_column is set, keep rows that share a cluster id
+                # (e.g. augmented symmetric siblings) in the same split so the
+                # Laplace-approximation acceptance ratio doesn't double-count.
                 train_size = int(minibatch_df.shape[0] * self.train_frac)
-                train_idx, test_idx = train_test_split(np.arange(minibatch_df.shape[0]), train_size=train_size, stratify=minibatch_y_train)
+                if self.cluster_column is None:
+                    train_idx, test_idx = train_test_split(
+                        np.arange(minibatch_df.shape[0]),
+                        train_size=train_size,
+                        stratify=minibatch_y_train,
+                    )
+                else:
+                    groups = minibatch_df[self.cluster_column].to_numpy()
+                    splitter = GroupShuffleSplit(n_splits=1, train_size=train_size)
+                    train_idx, test_idx = next(
+                        splitter.split(np.arange(minibatch_df.shape[0]), minibatch_y_train, groups=groups)
+                    )
                 
                 num_iter = i * self.num_meta_concepts + j
                 # All extracted concepts

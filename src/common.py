@@ -18,9 +18,7 @@ from src.logistic import LogisticRegressionTorch
 from src.utils import convert_to_json
 from src.llm_response_types import ExtractResponseList, GroupedExtractResponses
 
-sys.path.append('llm-api-main')
-from lab_llm.llm_api import LLMApi
-from lab_llm.dataset import TextDataset, ImageDataset, ImageGroupDataset
+from src.llm_utils import LLMApi, TextDataset, ImageDataset, ImageGroupDataset
 
 TABULAR_PREFIX = "Tabular feature: "
 
