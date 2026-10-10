@@ -165,6 +165,8 @@ def main(args):
         llm_reasoning_strs = [""] * len(missing_idxs)
         for grp_id in np.unique(group_ids):
             match_idxs = np.where(group_ids == grp_id)[0]
+            if any([llm_outputs[match_idx] is None for match_idx in match_idxs]):
+                continue
             grp_llm_output = ','.join(
                 [",".join(llm_outputs[match_idx].keyphrases) for match_idx in match_idxs]
             )

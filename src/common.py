@@ -145,7 +145,7 @@ def train_LR(X_train, y_train, penalty=None, use_acc:bool=False, seed:int = 0) -
         "n_jobs": -1,
     }
     
-    if penalty is None:
+    if penalty is None or penalty == "None":
         final_model = LogisticRegression(penalty=None)
         final_model.fit(X_train, y_train)
     elif penalty == "l1":
@@ -261,6 +261,7 @@ def extract_features_by_llm_grouped(
                     temperature=0,
                     max_retries=max_retries,
                     response_model=GroupedExtractResponses,
+                    thinking={"type": "disabled"},
                 )
             )
             print("grouped_llm_outputs", len(grouped_llm_outputs), dset_train.shape[0])
@@ -296,6 +297,7 @@ def extract_features_by_llm_grouped(
                     temperature=0,
                     max_retries=max_retries,
                     response_model=ExtractResponseList,
+                    thinking={"type": "disabled"},
                 )
             )
 

@@ -77,7 +77,7 @@ def parse_args(args):
     parser.add_argument("--batch-obs-size", type=int, default=1)
     parser.add_argument("--learner-type", type=str, default="count_l2",
                         choices=['count_elasticnet', 'tfidf_l2', 'tfidf_l1',
-                                 'count_l2', 'count_l1', 'count_rf'])
+                                 'count_l2', 'count_l1', 'count_rf', 'count_None'])
     parser.add_argument("--final-learner-type", type=str, default=None,
                         choices=['l1', 'l2', None])
     parser.add_argument("--inverse-penalty-param", type=int, default=20000)

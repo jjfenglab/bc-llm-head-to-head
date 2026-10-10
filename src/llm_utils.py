@@ -18,6 +18,7 @@ import logging
 from typing import Any, List, Optional
 
 import litellm
+litellm.drop_params = True
 from lab_llm import (
     CachingCompletion,
     ErrorTracker,
@@ -160,6 +161,7 @@ class LLMApi:
         validation_func=None,
         requests_per_second=None,
         response_model: Optional[type[BaseModel]] = None,
+        thinking: Optional[dict[str, Any]] = None,
     ) -> List[Any]:
         if is_image:
             raise NotImplementedError(
@@ -182,6 +184,8 @@ class LLMApi:
         if response_model is not None:
             kwargs["response_format"] = response_model
             kwargs["strict_response_format"] = True
+        if thinking is not None:
+            kwargs["thinking"] = thinking
 
         results = await self._api.run_batch(
             messages_list,
@@ -193,9 +197,9 @@ class LLMApi:
         outputs: List[Any] = []
         for i, result in enumerate(results):
             if isinstance(result, Exception):
-                self._logger.warning("LLM call failed for prompt %d: %s", i, result)
+                self._logger.info("LLM call failed for prompt %d: %s", i, result)
                 if isinstance(result, ResponseFormatError):
-                    self._logger.warning(
+                    self._logger.info(
                         "Full LLM output for prompt %d:\n%s", i, result.raw_content
                     )
                 outputs.append(None)
