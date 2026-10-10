@@ -98,10 +98,6 @@ def parse_args(args):
     parser.add_argument("--out-extractions-file", type=str,
                         default="_output/note_extractions.pkl")
     parser.add_argument("--aucs-plot-file", type=str, default="_output/aucs.png")
-    parser.add_argument("--resume", action="store_true",
-                        help="resume from --training-history-file; skip initial concept "
-                             "proposal and load the extractions cache from "
-                             "--out-extractions-file if it exists")
 
     args = parser.parse_args()
     assert args.use_api, "--use-api required (vLLM path not supported in this shim)"
@@ -159,11 +155,7 @@ def main(args):
 
     llm_dict = load_llms(args)
 
-    if args.resume:
-        if not os.path.exists(args.training_history_file):
-            raise FileNotFoundError(
-                f"--resume set but training history file not found: {args.training_history_file}"
-            )
+    if os.path.exists(args.training_history_file):
         history = TrainingHistory.load(args.training_history_file)
         logging.info("Resuming from %s (%d completed epochs)",
                      args.training_history_file, history._completed_epochs)
