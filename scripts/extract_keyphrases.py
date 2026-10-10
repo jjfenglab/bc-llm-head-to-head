@@ -171,8 +171,8 @@ def main(args):
             llm_output_strs[grp_id] = grp_llm_output
             llm_reasoning_strs[grp_id] = llm_outputs[match_idxs[0]].reasoning
     
-    data_df["llm_output"].iloc[missing_idxs] = llm_output_strs
-    data_df["llm_reasoning"].iloc[missing_idxs] = llm_reasoning_strs
+    data_df.loc[missing_idxs, "llm_output"] = llm_output_strs
+    data_df.loc[missing_idxs, "llm_reasoning"] = llm_reasoning_strs
     print("not na", (data_df.llm_output != "").sum())
     data_df.to_csv(args.llm_outputs_file, index=False)
 
