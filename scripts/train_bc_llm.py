@@ -11,6 +11,7 @@ imports rather than copied.
 import argparse
 import logging
 import os
+import pickle
 import sys
 
 import numpy as np
@@ -97,6 +98,10 @@ def parse_args(args):
     parser.add_argument("--out-extractions-file", type=str,
                         default="_output/note_extractions.pkl")
     parser.add_argument("--aucs-plot-file", type=str, default="_output/aucs.png")
+    parser.add_argument("--resume", action="store_true",
+                        help="resume from --training-history-file; skip initial concept "
+                             "proposal and load the extractions cache from "
+                             "--out-extractions-file if it exists")
 
     args = parser.parse_args()
     assert args.use_api, "--use-api required (vLLM path not supported in this shim)"
@@ -134,8 +139,6 @@ def main(args):
     os.makedirs(os.path.dirname(args.log_file) or ".", exist_ok=True)
     logging.basicConfig(format="%(message)s", filename=args.log_file, level=logging.INFO)
     logging.info(args)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
     load_dotenv()
 
     # Load the training partition and word-level features (shared with both legacy scripts).
@@ -156,12 +159,37 @@ def main(args):
 
     llm_dict = load_llms(args)
 
-    # Step 1: propose initial concepts from the top-word residual model.
-    init_concepts = propose_initial_concepts(args, data_df, X_features, y_train, feat_names, llm_dict)
-    logging.info("initial concepts: %s", [c["concept"] for c in init_concepts])
-
-    history = TrainingHistory(args.keep_x_cols)
-    history.add_concepts(init_concepts)
+    if args.resume:
+        if not os.path.exists(args.training_history_file):
+            raise FileNotFoundError(
+                f"--resume set but training history file not found: {args.training_history_file}"
+            )
+        history = TrainingHistory.load(args.training_history_file)
+        logging.info("Resuming from %s (%d completed epochs)",
+                     args.training_history_file, history._completed_epochs)
+        if os.path.exists(args.out_extractions_file):
+            with open(args.out_extractions_file, "rb") as f:
+                initial_extractions = pickle.load(f)
+            logging.info("Loaded %d cached extractions from %s",
+                         len(initial_extractions), args.out_extractions_file)
+        else:
+            initial_extractions = {}
+            logging.info("No extractions cache at %s; starting with empty cache",
+                         args.out_extractions_file)
+        # Diverge RNG from where a fresh run would be, so the MH chain doesn't
+        # retrace the same early draws it already made.
+        resume_seed = args.seed + history._completed_epochs
+        np.random.seed(resume_seed)
+        torch.manual_seed(resume_seed)
+    else:
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        # Step 1: propose initial concepts from the top-word residual model.
+        init_concepts = propose_initial_concepts(args, data_df, X_features, y_train, feat_names, llm_dict)
+        logging.info("initial concepts: %s", [c["concept"] for c in init_concepts])
+        history = TrainingHistory(args.keep_x_cols)
+        history.add_concepts(init_concepts)
+        initial_extractions = {}
 
     # Step 2: MH iterations over the concept set, seeded with those initial concepts.
     bayesian_cbm = ConceptLearnerModel(
@@ -203,6 +231,7 @@ def main(args):
         feat_names=feat_names,
         training_history_file=args.training_history_file,
         aucs_plot_file=args.aucs_plot_file,
+        initial_extractions=initial_extractions,
     )
 
 

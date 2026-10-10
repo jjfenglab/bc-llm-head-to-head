@@ -110,42 +110,98 @@ class ConceptLearnerModel:
         assert self.num_minibatch is None
         assert self.num_meta_concepts % self.num_greedy_holdout == 0
     
+    def _fit_and_record(
+            self,
+            data_df,
+            meta_concept_dicts,
+            all_extracted_features,
+            history,
+            training_history_file: str,
+            aucs_plot_file: str,
+            num_iter: int,
+        ):
+        """Extract features for the current concept set, fit LR, append to history, save.
+
+        Returns the updated extractions cache.
+        """
+        y_train = data_df['y'].to_numpy().flatten()
+        all_extracted_features = common.extract_features_by_llm_grouped(
+            self.llm_extraction,
+            data_df,
+            meta_concept_dicts=meta_concept_dicts[:self.num_meta_concepts],
+            all_extracted_features_dict=all_extracted_features,
+            prompt_file=self.prompt_concepts_file,
+            batch_size=self.batch_size,
+            max_new_tokens=8000,
+            batch_concept_size=self.batch_concept_size,
+            group_size=self.batch_obs_size,
+            is_image=self.is_image,
+            max_section_length=self.max_section_length,
+            extraction_file=self.out_extractions_file,
+        )
+        history.add_concepts(meta_concept_dicts)
+        logging.info(
+            "Iteration %d concepts %s (tot %d)",
+            num_iter,
+            [c['concept'] for c in meta_concept_dicts[:self.num_meta_concepts]],
+            len(meta_concept_dicts),
+        )
+        all_concept_extract_feat = common.get_features(
+            meta_concept_dicts, all_extracted_features, data_df,
+            force_keep_columns=self.force_keep_columns,
+        )
+        train_results = common.train_LR(
+            all_concept_extract_feat,
+            y_train,
+            penalty=self.final_learner_type,
+            use_acc=self.is_greedy_metric_acc,
+        )
+        logging.info("All extracted concepts AUC %f", train_results["auc"])
+        logging.info("All extracted concepts ACC %f", train_results["acc"])
+        logging.info('All extracted concepts coef %s', train_results["coef"])
+        history.add_auc(train_results["auc"])
+        history.add_coef(train_results["coef"])
+        history.add_intercept(train_results["intercept"])
+        history.add_model(train_results["model"])
+        history.save(training_history_file)
+        history.plot_aucs(aucs_plot_file)
+        return all_extracted_features
+
     def fit(self,
             data_df,
             X_features,
             feat_names,
             training_history_file: str,
-            aucs_plot_file: str):
+            aucs_plot_file: str,
+            initial_extractions: dict = None):
         history = self.init_history
-        # initialize concepts
         meta_concept_dicts = history.get_last_concepts()[:self.num_meta_concepts]
+        all_extracted_features = initial_extractions if initial_extractions is not None else {}
+        start_epoch = history._completed_epochs
 
-        # do posterior inference
-        minibatch_extracted_features = {}
-        all_extracted_features = {}
-        for i in range(self.max_epochs):
+        if start_epoch >= self.max_epochs:
+            logging.info(
+                "Already at max_epochs (%d completed, %d requested); nothing to do",
+                start_epoch, self.max_epochs,
+            )
+            return all_extracted_features
+
+        if start_epoch == 0:
+            # Fresh run: record initial state before any MH steps.
+            all_extracted_features = self._fit_and_record(
+                data_df, meta_concept_dicts, all_extracted_features,
+                history, training_history_file, aucs_plot_file, num_iter=-1,
+            )
+
+        for i in range(start_epoch, self.max_epochs):
             st_time = time.time()
             is_iter_greedy = self.do_greedy or (i < self.num_greedy_epochs)
             num_concept_holdout = self.num_greedy_holdout if is_iter_greedy else 1
             for j in range(0, self.num_meta_concepts, num_concept_holdout):
-                # If minibatch, then subset data first
+                iter_st_time = time.time()
                 minibatch_df = data_df
                 minibatch_X_features = X_features
                 minibatch_y_train = minibatch_df['y'].to_numpy().flatten()
-
-                all_extracted_features = common.extract_features_by_llm_grouped(
-                    self.llm_extraction,
-                    minibatch_df,
-                    meta_concept_dicts=meta_concept_dicts[:self.num_meta_concepts],
-                    all_extracted_features_dict=all_extracted_features,
-                    prompt_file=self.prompt_concepts_file,
-                    batch_size=self.batch_size,
-                    max_new_tokens=8000,
-                    batch_concept_size=self.batch_concept_size,
-                    group_size=self.batch_obs_size,
-                    is_image=self.is_image,
-                    max_section_length=self.max_section_length,
-                )
 
                 # randomly pick portion of data for generating LLM prior.
                 # If cluster_column is set, keep rows that share a cluster id
@@ -164,27 +220,8 @@ class ConceptLearnerModel:
                     train_idx, test_idx = next(
                         splitter.split(np.arange(minibatch_df.shape[0]), minibatch_y_train, groups=groups)
                     )
-                
+
                 num_iter = i * self.num_meta_concepts + j
-                # All extracted concepts
-                history.add_concepts(meta_concept_dicts)
-                logging.info("Iteration %d concepts %s (tot %d)", num_iter, [c['concept'] for c in meta_concept_dicts[:max(num_concept_holdout * 2, 10)]], len(meta_concept_dicts))
-                all_concept_extract_feat = common.get_features(meta_concept_dicts, all_extracted_features, minibatch_df, force_keep_columns=self.force_keep_columns)
-                train_results = common.train_LR(
-                    all_concept_extract_feat,
-                    minibatch_y_train,
-                    penalty=self.final_learner_type, # this technically should be none from a bayesian perspective
-                    use_acc=self.is_greedy_metric_acc)
-                logging.info("All extracted concepts AUC %f", train_results["auc"])
-                logging.info("All extracted concepts ACC %f", train_results["acc"])
-                # coefficients should follow from bayesian model. But it is ok for now...
-                history.add_auc(train_results["auc"])
-                history.add_coef(train_results["coef"])
-                logging.info('All extracted concepts coef %s', train_results["coef"])
-                history.add_intercept(train_results["intercept"])
-                history.add_model(train_results["model"])
-                history.save(training_history_file)
-                history.plot_aucs(aucs_plot_file)
 
                 # Extracted features minus the held out concept
                 concept_subset_dicts = meta_concept_dicts[:(self.num_meta_concepts - num_concept_holdout)]
@@ -207,16 +244,16 @@ class ConceptLearnerModel:
                     feat_names=feat_names_scrubbed,
                     num_replace=num_concept_holdout,
                     )
-                print('END OF PROMPT\n\n\n\n')
+                print(iter_llm_prompt)
 
                 # ask for candidates
                 raw_candidate_concept_dicts = self.query_for_new_cand(iter_llm_prompt, top_feat_names, max_new_tokens=self.max_new_tokens)
                 print("raw_candidate_concept_dicts", len(raw_candidate_concept_dicts), raw_candidate_concept_dicts)
-                
+
                 # extract candidate concepts
                 all_extracted_features = common.extract_features_by_llm_grouped(
                     self.llm_extraction,
-                    minibatch_df, 
+                    minibatch_df,
                     raw_candidate_concept_dicts,
                     all_extracted_features_dict=all_extracted_features,
                     prompt_file=self.prompt_concepts_file,
@@ -234,7 +271,7 @@ class ConceptLearnerModel:
                     # do greedy selection of new concept
                     selected_concept_dicts = self._do_greedy_step(
                         minibatch_df,
-                        extracted_features, 
+                        extracted_features,
                         minibatch_y_train,
                         raw_candidate_concept_dicts,
                         all_extracted_features,
@@ -252,11 +289,11 @@ class ConceptLearnerModel:
                     all_concept_dicts = concepts_to_replace + raw_candidate_concept_dicts
                     all_concept_dicts = prior_response.fill_candidate_concept_dicts(all_concept_dicts)
                     logging.info("candidate concept dicts %s", all_concept_dicts[1:])
-                    
+
                     # compute posterior and do gibbs-like sampling
                     selected_concept_dict = self._do_acceptance_rejection_step(
                         minibatch_df,
-                        extracted_features, 
+                        extracted_features,
                         minibatch_y_train,
                         train_idx,
                         test_idx,
@@ -273,9 +310,19 @@ class ConceptLearnerModel:
                 for c in meta_concept_dicts[:self.num_meta_concepts]:
                     logging.info("posterior sample iter %d: %s", num_iter, c['concept'])
 
-                logging.info("Time for iteration %d: %d (sec)", j, time.time() - st_time)
-                
-            logging.info("Time for epoch %d (sec)", time.time() - st_time)
+                # Fit the LR on the updated concept set and record to history.
+                all_extracted_features = self._fit_and_record(
+                    minibatch_df, meta_concept_dicts, all_extracted_features,
+                    history, training_history_file, aucs_plot_file, num_iter,
+                )
+
+                logging.info("Time for iteration %d: %d (sec)", j, time.time() - iter_st_time)
+
+            history._completed_epochs = i + 1
+            history.save(training_history_file)
+            logging.info("Time for epoch %d: %d (sec)", i, time.time() - st_time)
+
+        return all_extracted_features
     
     @staticmethod
     def fit_residual(model, word_names, X_extracted, X_words, y_train, penalty_downweight_factor: float, is_multiclass: bool, num_top: int, use_acc: bool = False, seed: int = None):
