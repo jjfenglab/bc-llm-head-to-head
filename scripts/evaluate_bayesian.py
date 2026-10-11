@@ -10,6 +10,7 @@ import pickle
 import pandas as pd
 import numpy as np
 import seaborn as sns
+import statsmodels.api as sm
 from matplotlib import pyplot as plt
 
 from sklearn.metrics import roc_auc_score, f1_score
@@ -187,6 +188,73 @@ def eval_ensemble(y_test, posterior_pred_prob, true_prob = None, is_multiclass=F
         "f1_str": [to_table_str(test_f1)],
     })
 
+def fit_unpenalized_logreg(features, y, feature_definitions, alpha=0.05):
+    """Fit unpenalized logistic regression and return coef estimates with CIs.
+
+    Fits (1) a univariate model per feature and (2) a single multivariate model
+    on all features jointly. Both include an intercept.
+
+    @param features: 2D array/DataFrame of feature values (n_obs x n_features).
+    @param y: binary outcome vector.
+    @param feature_definitions: ordered list of strings describing each feature
+        column — for concept features this is the yes/no question text used as
+        the feature definition. Length must equal features.shape[1].
+
+    Returns a DataFrame with columns: model, feature, feature_definition, coef,
+    ci_low, ci_high, pvalue, coef_str.
+    """
+    features = pd.DataFrame(features).apply(pd.to_numeric, errors="coerce")
+    assert len(feature_definitions) == features.shape[1], (
+        f"feature_definitions length {len(feature_definitions)} != "
+        f"n_features {features.shape[1]}"
+    )
+    feature_names = [f"x{i}" for i in range(features.shape[1])]
+    features.columns = feature_names
+    definition_map = {"const": "(intercept)"}
+    definition_map.update(dict(zip(feature_names, feature_definitions)))
+    rows = []
+
+    def _summarize(result, model_name, feature_names_in):
+        params = result.params
+        conf = result.conf_int(alpha=alpha)
+        pvals = result.pvalues
+        for name in feature_names_in:
+            coef = params[name]
+            lo, hi = conf.loc[name, 0], conf.loc[name, 1]
+            rows.append({
+                "model": model_name,
+                "feature": name,
+                "feature_definition": definition_map[name],
+                "coef": coef,
+                "ci_low": lo,
+                "ci_high": hi,
+                "pvalue": pvals[name],
+                "coef_str": f"{coef:.3f} ({lo:.3f}, {hi:.3f})",
+            })
+
+    # Univariate: one model per feature
+    for name in feature_names:
+        X = sm.add_constant(features[[name]], has_constant="add")
+        try:
+            res = sm.Logit(y, X).fit(disp=False)
+            _summarize(res, "univariate", ["const", name])
+        except Exception as e:
+            logging.warning("Univariate logit failed for %s: %s", name, e)
+
+    # Multivariate: single joint model
+    X_full = sm.add_constant(features, has_constant="add")
+    try:
+        res_full = sm.Logit(y, X_full).fit(disp=False)
+        _summarize(res_full, "multivariate", ["const"] + feature_names)
+    except Exception as e:
+        logging.warning("Multivariate logit failed: %s", e)
+
+    coef_df = pd.DataFrame(rows)
+    logging.info("Unpenalized logistic regression coefficients:\n%s", coef_df.to_string(index=False))
+    print(coef_df.to_string(index=False))
+    return coef_df
+
+
 def main(args):
     args = parse_args(args)
     logging.basicConfig(format="%(message)s", filename=args.log_file, level=logging.INFO)
@@ -209,9 +277,14 @@ def main(args):
 
     llm_dict = load_llms(args)
 
-    start_iter = max(0, history.num_iters - args.num_posterior_iters)
-    print("start_iter", start_iter, history.num_iters)
-    all_concepts_to_extract = [concept_dict for concept_dicts in history._concepts[start_iter:history.num_iters] for concept_dict in concept_dicts]
+    # Each eval iteration pairs concepts[i] with models[i]; the concepts list
+    # can be one longer than models when training was interrupted after
+    # add_concepts but before add_model, so bound the loop by the shorter list.
+    print("history.num_iters", history.num_iters, len(history._models))
+    num_eval_iters = min(history.num_iters, len(history._models))
+    start_iter = max(0, num_eval_iters - args.num_posterior_iters)
+    print("start_iter", start_iter, num_eval_iters)
+    all_concepts_to_extract = [concept_dict for concept_dicts in history._concepts[start_iter:num_eval_iters] for concept_dict in concept_dicts]
     
     all_extracted_features_dict = common.extract_features_by_llm_grouped(
         llm_dict['extraction'],
@@ -230,7 +303,7 @@ def main(args):
     y_test = test_data_df['y'].to_numpy().flatten()
     is_multiclass = np.unique(y_test).size > 2
     true_prob = test_data_df['true_prob'].to_numpy().flatten() if 'true_prob' in test_data_df.columns else None
-    for i in range(start_iter, history.num_iters):
+    for i in range(start_iter, num_eval_iters):
         concept_dicts = history._concepts[i]
         logging.info("ITER %d %s (%d)", i, [c['concept'] for c in concept_dicts][:10], len(concept_dicts))
         # logging.info("ITER %d %s %s", i, history._coefs[i], history._intercepts[i])
@@ -265,6 +338,15 @@ def main(args):
     res_df['method'] = args.method_name
     res_df['seed'] = args.seed
     res_df.to_csv(args.result_csv_file, index=False)
+
+    logging.info("===UNPENALIZED LOGREG===")
+    force_keep = list(history.force_keep_cols) if history.force_keep_cols is not None else []
+    feature_definitions = force_keep + [cd["concept"] for cd in concept_dicts]
+    coef_df = fit_unpenalized_logreg(extracted_features, y_test, feature_definitions)
+    coef_df['method'] = args.method_name
+    coef_df['seed'] = args.seed
+    coef_csv_file = os.path.splitext(args.result_csv_file)[0] + "_logreg_coefs.csv"
+    coef_df.to_csv(coef_csv_file, index=False)
 
     with open(args.out_extractions, "wb") as f:
         pickle.dump(all_extracted_features_dict, f)

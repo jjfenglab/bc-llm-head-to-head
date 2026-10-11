@@ -24,6 +24,7 @@ from src.concept_learner_model import ConceptLearnerModel, CandidateConcepts
 from src.llm_utils import LLMApi, create_llm_clients
 from src.training_history import TrainingHistory
 import src.common as common
+from src.bertopic_features import build_signed_bertopic_features
 from scripts.train_bayesian import load_data_partition, get_word_count_data, load_llms
 from scripts.train_baseline import generate_prior_prompt
 
@@ -43,7 +44,7 @@ def parse_args(args):
     parser.add_argument("--keep-x-cols", type=str, nargs="*",
                         help="tabular columns to force keep")
     parser.add_argument("--max-obs", type=int, default=0)
-    parser.add_argument("--min-prevalence", type=float, default=0)
+    parser.add_argument("--min-prevalence", type=float, default=0.01)
     parser.add_argument("--cluster-column", type=str, default=None,
                         help="Column whose values define cluster IDs; rows sharing a "
                              "value are kept in the same partial-posterior split "
@@ -57,10 +58,23 @@ def parse_args(args):
     # Baseline-init step
     parser.add_argument("--baseline-init-file", type=str, required=True,
                         help="prompt template for generating the initial concept set")
-    parser.add_argument("--num-top-attributes", type=int, default=40,
+    parser.add_argument("--num-top-attributes", type=int, default=20,
                         help="number of top words to show the LLM when proposing init concepts")
     parser.add_argument("--use-acc", action="store_true",
                         help="rank top words by accuracy rather than AUC")
+    parser.add_argument("--use-bertopic-init", action="store_true",
+                        help="cluster keyphrases into BERTopic topics (partitioned by A>B / B>A) "
+                             "and use topic presence/absence as init features instead of raw keyphrases")
+    parser.add_argument("--bertopic-nr-topics", type=int, default=100,
+                        help="target topic count per sign partition (A>B and B>A each)")
+    parser.add_argument("--bertopic-embedding-model", type=str, default="all-MiniLM-L6-v2",
+                        help="sentence-transformers model used to embed keyphrases for BERTopic")
+    parser.add_argument("--bertopic-top-k-phrases", type=int, default=3,
+                        help="max number of representative keyphrases to list per topic in the init prompt")
+    parser.add_argument("--bertopic-init-file", type=str, default=None,
+                        help="prompt template for the BERTopic init path "
+                             "(uses {top_topics_text} + {num_meta_concepts}); "
+                             "required when --use-bertopic-init is set")
     parser.add_argument("--max-tokens", type=int, default=10000,
                         help="max_new_tokens for the init-concepts LLM call")
     parser.add_argument("--config-file", type=str,
@@ -109,17 +123,79 @@ def parse_args(args):
     return args
 
 
-def propose_initial_concepts(args, data_df, X_words, y, word_names, llm_dict) -> list[dict]:
-    """Baseline step: ask the LLM for an initial concept set using top-word prompts."""
-    init_prompt = generate_prior_prompt(
+def _build_bertopic_init_prompt(args, data_df, y) -> str:
+    """Fit BERTopic, rank topics by |coef| in a residual LR, render list-of-lists."""
+    topic_feats = build_signed_bertopic_features(
         data_df,
-        X_words,
+        text_summary_column=args.text_summary_column,
+        nr_topics=args.bertopic_nr_topics,
+        seed=args.seed,
+        embedding_model=args.bertopic_embedding_model,
+    )
+    if topic_feats.X.shape[1] == 0:
+        raise RuntimeError("BERTopic produced zero non-noise topics; cannot build init prompt")
+    logging.info("BERTopic init features: shape=%s, n_topics=%d",
+                 topic_feats.X.shape, len(topic_feats.feat_names))
+
+    is_multiclass = np.unique(y).size > 2
+    X_keep = data_df[args.keep_x_cols].to_numpy() if args.keep_x_cols is not None else None
+    top_df = ConceptLearnerModel.fit_residual(
+        args.model,
+        topic_feats.feat_names.tolist(),
+        X_keep,
+        topic_feats.X,
         y,
-        word_names=word_names,
-        args=args,
+        penalty_downweight_factor=100,
+        is_multiclass=is_multiclass,
         num_top=args.num_top_attributes,
         use_acc=args.use_acc,
+        seed=args.seed,
     )
+    selected_names = top_df["feature_name"].tolist()
+    coefs = dict(zip(top_df["feature_name"].tolist(), top_df["coef"].tolist()))
+    top_topics_text = topic_feats.render_topics(
+        selected_names,
+        top_k_phrases=args.bertopic_top_k_phrases,
+        coefs=coefs,
+    )
+
+    assert args.bertopic_init_file is not None, (
+        "--bertopic-init-file is required when --use-bertopic-init is set"
+    )
+    with open(args.bertopic_init_file, "r") as f:
+        prompt_template = f.read()
+    prompt_template = prompt_template.replace("{top_topics_text}", top_topics_text)
+    prompt_template = prompt_template.replace(
+        "{num_meta_concepts}", str(args.num_meta_concepts)
+    )
+    if args.config_file is not None:
+        import json
+        with open(args.config_file, "r") as f:
+            for k, v in json.load(f).items():
+                prompt_template = prompt_template.replace(k, v)
+    return prompt_template
+
+
+def propose_initial_concepts(args, data_df, X_words, y, word_names, llm_dict) -> list[dict]:
+    """Baseline step: ask the LLM for an initial concept set.
+
+    Default path: fit a residual LR over the raw keyphrase vocabulary and show
+    the top keyphrases to the LLM. With --use-bertopic-init: cluster keyphrases
+    (A>B and B>A partitions clustered separately), rank topics by |coef|, and
+    show each as a list of its most frequent member keyphrases with counts.
+    """
+    if args.use_bertopic_init:
+        init_prompt = _build_bertopic_init_prompt(args, data_df, y)
+    else:
+        init_prompt = generate_prior_prompt(
+            data_df,
+            X_words,
+            y,
+            word_names=word_names,
+            args=args,
+            num_top=args.num_top_attributes,
+            use_acc=args.use_acc,
+        )
     logging.info("INIT LLM PROMPT %s", init_prompt)
     candidate = llm_dict["iter"].get_output(
         init_prompt,

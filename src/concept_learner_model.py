@@ -179,6 +179,13 @@ class ConceptLearnerModel:
         all_extracted_features = initial_extractions if initial_extractions is not None else {}
         start_epoch = history._completed_epochs
 
+        if start_epoch == 0:
+            # Fresh run: record initial state before any MH steps.
+            all_extracted_features = self._fit_and_record(
+                data_df, meta_concept_dicts, all_extracted_features,
+                history, training_history_file, aucs_plot_file, num_iter=-1,
+            )
+
         if start_epoch >= self.max_epochs:
             logging.info(
                 "Already at max_epochs (%d completed, %d requested); nothing to do",
@@ -186,12 +193,6 @@ class ConceptLearnerModel:
             )
             return all_extracted_features
 
-        if start_epoch == 0:
-            # Fresh run: record initial state before any MH steps.
-            all_extracted_features = self._fit_and_record(
-                data_df, meta_concept_dicts, all_extracted_features,
-                history, training_history_file, aucs_plot_file, num_iter=-1,
-            )
 
         for i in range(start_epoch, self.max_epochs):
             st_time = time.time()
@@ -333,6 +334,7 @@ class ConceptLearnerModel:
             num_fixed = X_extracted.shape[1]
             word_resid_X = np.concatenate([X_extracted * penalty_downweight_factor, X_words], axis=1)
             # word_resid_X = np.concatenate([X_extracted, X_words], axis=1)
+        logging.info(f"DF fit residual shape {word_resid_X.shape}")
         results = common.train_LR(word_resid_X, y_train, penalty=model, use_acc=use_acc, seed=seed)
         print("MODEL ACC AUC", results["acc"], results["auc"])
         logging.info("residual fit AUC: %f", results["auc"])
@@ -537,7 +539,7 @@ class ConceptLearnerModel:
         return laplace_approx_prob * prior
     
     def compute_lik_and_invcov_mat(self, train_X, train_y, C, eval_X, eval_y):
-        model = LogisticRegression(penalty='l2', C=C, fit_intercept=False, multi_class="multinomial", max_iter=10000)
+        model = LogisticRegression(penalty='l2', C=C, fit_intercept=False, max_iter=10000)
         model.fit(train_X, train_y)
         theta = model.coef_.flatten().reshape((-1,1))
         # evaluate on evaluation data
@@ -623,8 +625,27 @@ class ConceptLearnerModel:
         return X_features[:, keep_mask], feat_names[keep_mask]
     
     def query_for_new_cand(self, iter_llm_prompt, top_feat_names, times_to_retry=1, max_new_tokens=5000):
-        llm_response = self.llm_iter.get_output(iter_llm_prompt, max_new_tokens=max_new_tokens, response_model=CandidateConcepts)
-        candidate_concept_dicts = llm_response.to_dicts(default_prior=self.default_prior)
+        candidate_concept_dicts = []
+        last_err = None
+        for attempt in range(times_to_retry + 1):
+            try:
+                if attempt > 0:
+                    iter_llm_prompt += "\nCarefully match the requested JSON structure. Do not include quotes inside the reasoning.\n"
+                llm_response = self.llm_iter.get_output(
+                    iter_llm_prompt,
+                    max_new_tokens=max_new_tokens,
+                    response_model=CandidateConcepts)
+                candidate_concept_dicts = llm_response.to_dicts(default_prior=self.default_prior)
+                if candidate_concept_dicts:
+                    break
+                print(f"query_for_new_cand: empty candidate list (attempt {attempt + 1}/{times_to_retry + 1})")
+            except Exception as err:
+                last_err = err
+                print(f"query_for_new_cand: LLM call failed (attempt {attempt + 1}/{times_to_retry + 1}): {err}")
+        else:
+            if last_err is not None:
+                raise last_err
+
         candidate_concept_dicts += [{
             "concept": feat_name,
             "prior": self.default_prior
