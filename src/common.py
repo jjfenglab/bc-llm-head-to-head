@@ -312,8 +312,12 @@ def extract_features_by_llm_grouped(
         # fill in dictionary with extractions        
         for idx, concept in enumerate(batch_concepts_to_extract):
             extracted_features = extracted_llm_outputs[:, idx:idx + 1]
-            logging.info("concept %s, prevalence %f",
-                        concept, np.mean(extracted_features))
+            logging.info("concept %s, non-zero prevalence %f, prevalence=1 %f, prevalence=-1 %f",
+                        concept,
+                        np.mean(extracted_features != 0),
+                        np.mean(extracted_features == 1),
+                        np.mean(extracted_features == -1),
+                        )
             all_extracted_features_dict[concept] = extracted_features
 
         if extraction_file is not None:
