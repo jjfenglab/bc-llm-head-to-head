@@ -259,7 +259,7 @@ class ConceptLearnerModel:
                     feat_names=feat_names_scrubbed,
                     num_replace=num_concept_holdout,
                     )
-                print(iter_llm_prompt)
+                logging.info(f"ITER LLM PROMPT {iter_llm_prompt}")
 
                 # ask for candidates
                 raw_candidate_concept_dicts = self.query_for_new_cand(iter_llm_prompt, top_feat_names, max_new_tokens=self.max_new_tokens)

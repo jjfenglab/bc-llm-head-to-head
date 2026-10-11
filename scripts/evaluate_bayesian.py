@@ -250,8 +250,8 @@ def fit_unpenalized_logreg(features, y, feature_definitions, alpha=0.05):
         logging.warning("Multivariate logit failed: %s", e)
 
     coef_df = pd.DataFrame(rows)
-    logging.info("Unpenalized logistic regression coefficients:\n%s", coef_df.to_string(index=False))
-    print(coef_df.to_string(index=False))
+    logging.info("Unpenalized logistic regression coefficients:\n%s", coef_df[coef_df.feature != "const"].to_string(index=False))
+    print(coef_df[coef_df.feature != "const"].to_string(index=False))
     return coef_df
 
 
