@@ -24,7 +24,7 @@ from src.concept_learner_model import ConceptLearnerModel, CandidateConcepts
 from src.llm_utils import LLMApi, create_llm_clients
 from src.training_history import TrainingHistory
 import src.common as common
-from src.bertopic_features import build_signed_bertopic_features
+from src.bertopic_features import SignedBertopicModel
 from scripts.train_bayesian import load_data_partition, get_word_count_data, load_llms
 from scripts.train_baseline import generate_prior_prompt
 
@@ -62,7 +62,7 @@ def parse_args(args):
                         help="number of top words to show the LLM when proposing init concepts")
     parser.add_argument("--use-acc", action="store_true",
                         help="rank top words by accuracy rather than AUC")
-    parser.add_argument("--use-bertopic-init", action="store_true",
+    parser.add_argument("--use-bertopic", action="store_true",
                         help="cluster keyphrases into BERTopic topics (partitioned by A>B / B>A) "
                              "and use topic presence/absence as init features instead of raw keyphrases")
     parser.add_argument("--bertopic-nr-topics", type=int, default=100,
@@ -74,7 +74,11 @@ def parse_args(args):
     parser.add_argument("--bertopic-init-file", type=str, default=None,
                         help="prompt template for the BERTopic init path "
                              "(uses {top_topics_text} + {num_meta_concepts}); "
-                             "required when --use-bertopic-init is set")
+                             "required when --use-bertopic is set")
+    parser.add_argument("--bertopic-iter-file", type=str, default=None,
+                        help="prompt template for the BERTopic MH iteration path "
+                             "(uses {top_topics_text}, {meta_concepts}, {num_concepts}, "
+                             "{num_concepts_fixed}); required when --use-bertopic is set")
     parser.add_argument("--max-tokens", type=int, default=10000,
                         help="max_new_tokens for the init-concepts LLM call")
     parser.add_argument("--config-file", type=str,
@@ -123,20 +127,8 @@ def parse_args(args):
     return args
 
 
-def _build_bertopic_init_prompt(args, data_df, y) -> str:
-    """Fit BERTopic, rank topics by |coef| in a residual LR, render list-of-lists."""
-    topic_feats = build_signed_bertopic_features(
-        data_df,
-        text_summary_column=args.text_summary_column,
-        nr_topics=args.bertopic_nr_topics,
-        seed=args.seed,
-        embedding_model=args.bertopic_embedding_model,
-    )
-    if topic_feats.X.shape[1] == 0:
-        raise RuntimeError("BERTopic produced zero non-noise topics; cannot build init prompt")
-    logging.info("BERTopic init features: shape=%s, n_topics=%d",
-                 topic_feats.X.shape, len(topic_feats.feat_names))
-
+def _build_bertopic_init_prompt(args, data_df, y, topic_feats) -> str:
+    """Rank already-built BERTopic topic features by |coef| and render list-of-lists."""
     is_multiclass = np.unique(y).size > 2
     X_keep = data_df[args.keep_x_cols].to_numpy() if args.keep_x_cols is not None else None
     top_df = ConceptLearnerModel.fit_residual(
@@ -160,7 +152,7 @@ def _build_bertopic_init_prompt(args, data_df, y) -> str:
     )
 
     assert args.bertopic_init_file is not None, (
-        "--bertopic-init-file is required when --use-bertopic-init is set"
+        "--bertopic-init-file is required when --use-bertopic is set"
     )
     with open(args.bertopic_init_file, "r") as f:
         prompt_template = f.read()
@@ -176,16 +168,17 @@ def _build_bertopic_init_prompt(args, data_df, y) -> str:
     return prompt_template
 
 
-def propose_initial_concepts(args, data_df, X_words, y, word_names, llm_dict) -> list[dict]:
+def propose_initial_concepts(args, data_df, X_words, y, word_names, llm_dict, topic_feats=None) -> list[dict]:
     """Baseline step: ask the LLM for an initial concept set.
 
     Default path: fit a residual LR over the raw keyphrase vocabulary and show
-    the top keyphrases to the LLM. With --use-bertopic-init: cluster keyphrases
+    the top keyphrases to the LLM. With --use-bertopic: cluster keyphrases
     (A>B and B>A partitions clustered separately), rank topics by |coef|, and
     show each as a list of its most frequent member keyphrases with counts.
     """
-    if args.use_bertopic_init:
-        init_prompt = _build_bertopic_init_prompt(args, data_df, y)
+    if args.use_bertopic:
+        assert topic_feats is not None
+        init_prompt = _build_bertopic_init_prompt(args, data_df, y, topic_feats)
     else:
         init_prompt = generate_prior_prompt(
             data_df,
@@ -229,6 +222,27 @@ def main(args):
     logging.info("data_df shape %s, X_features shape %s, num classes %d",
                  data_df.shape, X_features.shape, np.unique(y_train).size)
 
+    # BERTopic mode: fit once over the full training keyphrase corpus. The
+    # same model is used to render the init prompt, as the residual-feature
+    # source for MH, and to produce rendered topic blocks in each MH prompt.
+    bertopic_model = None
+    topic_feats = None
+    if args.use_bertopic:
+        assert args.bertopic_iter_file is not None, (
+            "--bertopic-iter-file is required when --use-bertopic is set"
+        )
+        bertopic_model = SignedBertopicModel(
+            n_topics=args.bertopic_nr_topics,
+            seed=args.seed,
+            embedding_model=args.bertopic_embedding_model,
+        )
+        bertopic_model.partial_fit(data_df, args.text_summary_column)
+        topic_feats = bertopic_model.build_features(data_df, args.text_summary_column)
+        if topic_feats.X.shape[1] == 0:
+            raise RuntimeError("BERTopic produced zero non-noise topics")
+        logging.info("BERTopic features: shape=%s, n_topics=%d",
+                     topic_feats.X.shape, len(topic_feats.feat_names))
+
     llm_dict = load_llms(args)
 
     if os.path.exists(args.training_history_file):
@@ -253,13 +267,24 @@ def main(args):
         np.random.seed(args.seed)
         torch.manual_seed(args.seed)
         # Step 1: propose initial concepts from the top-word residual model.
-        init_concepts = propose_initial_concepts(args, data_df, X_features, y_train, feat_names, llm_dict)
+        init_concepts = propose_initial_concepts(
+            args, data_df, X_features, y_train, feat_names, llm_dict,
+            topic_feats=topic_feats,
+        )
         logging.info("initial concepts: %s", [c["concept"] for c in init_concepts])
         history = TrainingHistory(args.keep_x_cols)
         history.add_concepts(init_concepts)
         initial_extractions = {}
 
     # Step 2: MH iterations over the concept set, seeded with those initial concepts.
+    if bertopic_model is not None:
+        prompt_iter_file = args.bertopic_iter_file
+        X_for_mh = topic_feats.X
+        feat_names_for_mh = topic_feats.feat_names
+    else:
+        prompt_iter_file = args.prompt_iter_file
+        X_for_mh = X_features
+        feat_names_for_mh = feat_names
     bayesian_cbm = ConceptLearnerModel(
         init_history=history,
         llm_iter=llm_dict["iter"],
@@ -268,7 +293,7 @@ def main(args):
         num_minibatch=args.num_minibatch,
         num_meta_concepts=args.num_meta_concepts,
         prompt_iter_type=args.prompt_iter_type,
-        prompt_iter_file=args.prompt_iter_file,
+        prompt_iter_file=prompt_iter_file,
         config={},
         prompt_concepts_file=args.prompt_concepts_file,
         prompt_prior_file=args.prompt_prior_file,
@@ -292,11 +317,13 @@ def main(args):
         num_top=args.num_top_residual_words,
         max_new_tokens=args.max_new_tokens,
         cluster_column=args.cluster_column,
+        bertopic_model=bertopic_model,
+        bertopic_top_k_phrases=args.bertopic_top_k_phrases,
     )
     bayesian_cbm.fit(
         data_df,
-        X_features=X_features,
-        feat_names=feat_names,
+        X_features=X_for_mh,
+        feat_names=feat_names_for_mh,
         training_history_file=args.training_history_file,
         aucs_plot_file=args.aucs_plot_file,
         initial_extractions=initial_extractions,

@@ -23,6 +23,7 @@ from src.utils import convert_to_json, convert_to_list_of_jsons
 from src.training_history import TrainingHistory
 import src.common as common
 from src.llm_response_types import PriorResponse, CandidateConcepts
+from src.bertopic_features import SignedBertopicModel
 
 
 class ConceptLearnerModel:
@@ -72,6 +73,8 @@ class ConceptLearnerModel:
             num_minibatch: int = None,
             is_greedy_metric_acc: bool = False,
             cluster_column: Optional[str] = None,
+            bertopic_model: Optional[SignedBertopicModel] = None,
+            bertopic_top_k_phrases: int = 10,
             ):
         self.init_history = init_history
         self.llm_iter = llm_iter
@@ -106,6 +109,9 @@ class ConceptLearnerModel:
         self.batch_concept_size = batch_concept_size
         self.final_learner_type = final_learner_type
         self.cluster_column = cluster_column
+        self.bertopic_model = bertopic_model
+        self.bertopic_top_k_phrases = bertopic_top_k_phrases
+        self.use_bertopic = bertopic_model is not None
 
         assert self.num_minibatch is None
         assert self.num_meta_concepts % self.num_greedy_holdout == 0
@@ -234,9 +240,17 @@ class ConceptLearnerModel:
                 # generate LLM prior, dropping one concept from the mix
                 extracted_features = common.get_features(concept_subset_dicts, all_extracted_features, minibatch_df, force_keep_columns=self.force_keep_columns)
 
-                X_scrubbed, feat_names_scrubbed = self.scrub_vectorized_sentences(minibatch_X_features, feat_names, concept_subset_dicts)
+                if self.use_bertopic:
+                    X_scrubbed, feat_names_scrubbed = minibatch_X_features, feat_names
+                else:
+                    X_scrubbed, feat_names_scrubbed = self.scrub_vectorized_sentences(minibatch_X_features, feat_names, concept_subset_dicts)
                 concepts_to_replace = meta_concept_dicts[-num_concept_holdout:]
-                iter_llm_prompt, meta_concepts_text, top_features_text, top_feat_names = self.make_new_concept_prompt(
+                prompt_fn = (
+                    self.make_new_concept_prompt_bertopic
+                    if self.use_bertopic
+                    else self.make_new_concept_prompt
+                )
+                iter_llm_prompt, meta_concepts_text, top_features_text, top_feat_names = prompt_fn(
                     X_extracted=extracted_features[train_idx],
                     X_words=X_scrubbed[train_idx],
                     y = minibatch_y_train[train_idx],
@@ -615,6 +629,57 @@ class ConceptLearnerModel:
         
         prompt_template = self.fill_config(prompt_template)
         return prompt_template, meta_concepts_text, top_features_text, top_df.feature_name
+
+    def make_new_concept_prompt_bertopic(
+            self,
+            X_extracted,
+            X_words,
+            y,
+            data_df,
+            extract_feature_names,
+            feat_names,
+            num_replace: int = 1,
+        ):
+        """BERTopic variant of make_new_concept_prompt.
+
+        X_words here is actually the current (train-split) topic feature matrix,
+        and feat_names are the matching short topic IDs ("[A>B] topic 3"). The
+        bertopic model is retained on self.bertopic_model and already holds the
+        phrase/count metadata needed to render the list-of-lists prompt block.
+        """
+        with open(self.prompt_iter_file, 'r') as file:
+            prompt_template = file.read()
+
+        top_df = self.fit_residual(
+            self.residual_model_type,
+            feat_names.tolist(),
+            X_extracted,
+            X_words,
+            y,
+            penalty_downweight_factor=self.penalty_downweight_factor,
+            is_multiclass=self.is_multiclass,
+            num_top=self.num_top,
+            use_acc=self.is_greedy_metric_acc,
+        )
+        selected_names = top_df["feature_name"].tolist()
+        coefs = dict(zip(top_df["feature_name"].tolist(), top_df["coef"].tolist()))
+        top_topics_text = self.bertopic_model.render_topics(
+            selected_names,
+            top_k_phrases=self.bertopic_top_k_phrases,
+            coefs=coefs,
+        )
+        prompt_template = prompt_template.replace("{top_topics_text}", top_topics_text)
+
+        prompt_template = prompt_template.replace("{num_concepts}", str(self.num_meta_concepts))
+        meta_concepts_text = ""
+        for i, feat_name in enumerate(extract_feature_names):
+            meta_concepts_text += f"* X{i} = {feat_name} \n"
+        prompt_template = prompt_template.replace("{meta_concepts}", meta_concepts_text)
+        prompt_template = prompt_template.replace("{num_concepts_fixed}", str(self.num_meta_concepts - num_replace))
+        prompt_template = prompt_template.replace("{num_attributes}", str(top_df.shape[0]))
+
+        prompt_template = self.fill_config(prompt_template)
+        return prompt_template, meta_concepts_text, top_topics_text, top_df.feature_name
 
     def scrub_vectorized_sentences(self, X_features, feat_names, concept_dicts: list):
         # Remove the words that are too correlated with the concepts from the residual model's inputs

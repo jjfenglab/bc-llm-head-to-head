@@ -134,6 +134,49 @@ class SignedBertopicModel:
         all_topics.extend(model.topics_)
         model.topics_ = list(all_topics)
 
+    def current_topic_metadata(
+        self,
+    ) -> Tuple[List[str], Dict[str, List[Tuple[str, int]]], Dict[str, int]]:
+        """Return (feat_names, topic_phrases, topic_size) under current model state.
+
+        Cheap: iterates the accumulated phrase/topic lists, no feature matrix build.
+        """
+        topic_ids_ab = sorted({t for t in self.all_topics_ab if t != -1})
+        topic_ids_ba = sorted({t for t in self.all_topics_ba if t != -1})
+        names: List[str] = []
+        topic_phrases: Dict[str, List[Tuple[str, int]]] = {}
+        topic_size: Dict[str, int] = {}
+        for t in topic_ids_ab:
+            name = f"[A>B] topic {t}"
+            names.append(name)
+            pc = _phrase_counts_for_topic(self.all_phrases_ab, self.all_topics_ab, t)
+            topic_phrases[name] = pc
+            topic_size[name] = sum(c for _, c in pc)
+        for t in topic_ids_ba:
+            name = f"[B>A] topic {t}"
+            names.append(name)
+            pc = _phrase_counts_for_topic(self.all_phrases_ba, self.all_topics_ba, t)
+            topic_phrases[name] = pc
+            topic_size[name] = sum(c for _, c in pc)
+        return names, topic_phrases, topic_size
+
+    def render_topics(
+        self,
+        selected_feat_names: List[str],
+        top_k_phrases: int = 10,
+        coefs: Dict[str, float] | None = None,
+    ) -> str:
+        """Convenience: render a list-of-lists for a subset of current topics."""
+        _, topic_phrases, topic_size = self.current_topic_metadata()
+        feats = SignedBertopicFeatures(
+            X=np.zeros((0, 0), dtype=np.int64),
+            feat_names=np.array([], dtype=object),
+            topic_phrases=topic_phrases,
+            topic_size=topic_size,
+            model=self,
+        )
+        return feats.render_topics(selected_feat_names, top_k_phrases=top_k_phrases, coefs=coefs)
+
     def partial_fit(self, data_df: pd.DataFrame, text_summary_column: str) -> None:
         """Incorporate new comma-separated keyphrases from `data_df` into both models."""
         per_obs = _per_obs_phrases(data_df[text_summary_column])
