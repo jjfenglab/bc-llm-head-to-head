@@ -223,7 +223,7 @@ class ConceptLearnerModel:
                     )
                 else:
                     groups = minibatch_df[self.cluster_column].to_numpy()
-                    splitter = GroupShuffleSplit(n_splits=1, train_size=train_size)
+                    splitter = GroupShuffleSplit(n_splits=1, train_size=self.train_frac)
                     train_idx, test_idx = next(
                         splitter.split(np.arange(minibatch_df.shape[0]), minibatch_y_train, groups=groups)
                     )

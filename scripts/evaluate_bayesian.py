@@ -339,6 +339,8 @@ def main(args):
     res_df['seed'] = args.seed
     res_df.to_csv(args.result_csv_file, index=False)
 
+    # To get frequentist stat inference, refit the model on the test data and
+    # get p-values/confidnece intervals on the held-out data
     logging.info("===UNPENALIZED LOGREG===")
     force_keep = list(history.force_keep_cols) if history.force_keep_cols is not None else []
     feature_definitions = force_keep + [cd["concept"] for cd in concept_dicts]
