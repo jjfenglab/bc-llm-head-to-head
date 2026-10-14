@@ -5,18 +5,25 @@ import os
 import sys
 import logging
 import argparse
+import subprocess
+import tempfile
 import torch
 import pickle
 import pandas as pd
 import numpy as np
 import seaborn as sns
-import statsmodels.api as sm
 from matplotlib import pyplot as plt
 
 from sklearn.metrics import roc_auc_score, f1_score
+from sklearn.linear_model import LogisticRegression
 from scipy.stats import pearsonr
 from sklearn.calibration import CalibrationDisplay
 from sklearn.calibration import calibration_curve
+
+R_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+R_LOGREG_COEFS = os.path.join(R_SCRIPT_DIR, "logreg_coefs.R")
+R_LOGREG_WALD = os.path.join(R_SCRIPT_DIR, "logreg_wald.R")
+R_LOGREG_AUC_TEST = os.path.join(R_SCRIPT_DIR, "logreg_auc_test.R")
 
 sys.path.append(os.getcwd())
 from src.training_history import TrainingHistory
@@ -59,6 +66,27 @@ def parse_args(args):
     parser.add_argument("--log-file", type=str, default="_output/log_plot.txt")
     parser.add_argument("--result-csv-file", type=str, default="_output/res.csv")
     parser.add_argument("--calib-plot-file", type=str, default="_output/calib.png")
+    parser.add_argument(
+        "--cluster-column",
+        type=str,
+        default=None,
+        help="Column in the test data whose values define cluster IDs; "
+             "when set, logistic-regression inference uses cluster-robust "
+             "standard errors and the LRT uses cluster-robust Wald "
+             "statistics to compare keep-x-cols-only vs. full models.",
+    )
+    parser.add_argument(
+        "--drop-cols",
+        type=str,
+        nargs="*",
+        default=[],
+        help="Feature columns (matched against feature_definitions, i.e. "
+             "force-keep column names or concept definition strings) to drop "
+             "before fitting the logistic regression. Pass as a "
+             "space-separated list. Useful for breaking collinearity, e.g. "
+             "dropping one level of each one-hot encoding to serve as the "
+             "reference.",
+    )
     args = parser.parse_args()
     args.partition = "test"
     return args
@@ -188,71 +216,178 @@ def eval_ensemble(y_test, posterior_pred_prob, true_prob = None, is_multiclass=F
         "f1_str": [to_table_str(test_f1)],
     })
 
-def fit_unpenalized_logreg(features, y, feature_definitions, alpha=0.05):
-    """Fit unpenalized logistic regression and return coef estimates with CIs.
-
-    Fits (1) a univariate model per feature and (2) a single multivariate model
-    on all features jointly. Both include an intercept.
-
-    @param features: 2D array/DataFrame of feature values (n_obs x n_features).
-    @param y: binary outcome vector.
-    @param feature_definitions: ordered list of strings describing each feature
-        column — for concept features this is the yes/no question text used as
-        the feature definition. Length must equal features.shape[1].
-
-    Returns a DataFrame with columns: model, feature, feature_definition, coef,
-    ci_low, ci_high, pvalue, coef_str.
-    """
+def _write_features_csv(features, y, cluster_ids, path):
+    """Write features (as x0..x{p-1}), y, and optional cluster id to CSV."""
     features = pd.DataFrame(features).apply(pd.to_numeric, errors="coerce")
+    features.columns = [f"x{i}" for i in range(features.shape[1])]
+    features = features.copy()
+    features["y"] = np.asarray(y).astype(int)
+    if cluster_ids is not None:
+        features["__cluster__"] = np.asarray(cluster_ids)
+    features.to_csv(path, index=False)
+
+
+def _run_rscript(script_path, extra_args):
+    cmd = ["Rscript", script_path] + list(extra_args)
+    logging.info("Running: %s", " ".join(cmd))
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.stdout:
+        logging.info("Rscript stdout:\n%s", result.stdout)
+    if result.stderr:
+        logging.info("Rscript stderr:\n%s", result.stderr)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Rscript {script_path} failed (code {result.returncode}):\n"
+            f"{result.stderr}"
+        )
+
+
+def fit_unpenalized_logreg(features, y, feature_definitions,
+                           cluster_ids=None):
+    """Fit unpenalized logistic regression via Rscript and return a tidy df.
+
+    Delegates to scripts/logreg_coefs.R, which fits one univariate model per
+    feature plus a joint multivariate model (both with intercept). When
+    cluster_ids is provided, R uses cluster-robust (sandwich, CR0/HC0)
+    standard errors; otherwise classical model-based SEs.
+
+    @param features: n_obs x n_features array-like.
+    @param y: binary outcome vector aligned with rows of features.
+    @param feature_definitions: ordered list of column descriptions used to
+        annotate the output; length must equal features.shape[1].
+    @param cluster_ids: optional array of cluster labels aligned with rows.
+
+    Returns a DataFrame with columns: model, feature, feature_definition,
+    coef, ci_low, ci_high, pvalue, coef_str.
+    """
+    features = pd.DataFrame(features)
     assert len(feature_definitions) == features.shape[1], (
         f"feature_definitions length {len(feature_definitions)} != "
         f"n_features {features.shape[1]}"
     )
-    feature_names = [f"x{i}" for i in range(features.shape[1])]
-    features.columns = feature_names
+
+    # with tempfile.TemporaryDirectory() as tmp:
+    tmp = "_output"
+    in_csv = os.path.join(tmp, "features.csv")
+    out_csv = os.path.join(tmp, "coefs.csv")
+    _write_features_csv(features, y, cluster_ids, in_csv)
+    rargs = ["--in", in_csv, "--out", out_csv]
+    if cluster_ids is not None:
+        rargs += ["--cluster-col", "__cluster__"]
+    _run_rscript(R_LOGREG_COEFS, rargs)
+    coef_df = pd.read_csv(out_csv)
+
     definition_map = {"const": "(intercept)"}
-    definition_map.update(dict(zip(feature_names, feature_definitions)))
-    rows = []
+    definition_map.update(
+        {f"x{i}": d for i, d in enumerate(feature_definitions)}
+    )
+    coef_df["feature_definition"] = coef_df["feature"].map(definition_map)
 
-    def _summarize(result, model_name, feature_names_in):
-        params = result.params
-        conf = result.conf_int(alpha=alpha)
-        pvals = result.pvalues
-        for name in feature_names_in:
-            coef = params[name]
-            lo, hi = conf.loc[name, 0], conf.loc[name, 1]
-            rows.append({
-                "model": model_name,
-                "feature": name,
-                "feature_definition": definition_map[name],
-                "coef": coef,
-                "ci_low": lo,
-                "ci_high": hi,
-                "pvalue": pvals[name],
-                "coef_str": f"{coef:.3f} ({lo:.3f}, {hi:.3f})",
-            })
-
-    # Univariate: one model per feature
-    for name in feature_names:
-        X = sm.add_constant(features[[name]], has_constant="add")
-        try:
-            res = sm.Logit(y, X).fit(disp=False)
-            _summarize(res, "univariate", ["const", name])
-        except Exception as e:
-            logging.warning("Univariate logit failed for %s: %s", name, e)
-
-    # Multivariate: single joint model
-    X_full = sm.add_constant(features, has_constant="add")
-    try:
-        res_full = sm.Logit(y, X_full).fit(disp=False)
-        _summarize(res_full, "multivariate", ["const"] + feature_names)
-    except Exception as e:
-        logging.warning("Multivariate logit failed: %s", e)
-
-    coef_df = pd.DataFrame(rows)
-    logging.info("Unpenalized logistic regression coefficients:\n%s", coef_df[coef_df.feature != "const"].to_string(index=False))
+    logging.info(
+        "Unpenalized logistic regression coefficients:\n%s",
+        coef_df[coef_df.feature != "const"].to_string(index=False),
+    )
     print(coef_df[coef_df.feature != "const"].to_string(index=False))
     return coef_df
+
+
+def test_concepts_add_signal(features, y, feature_definitions, n_force_keep,
+                             cluster_ids=None):
+    """Test whether concept features add signal beyond the force-keep features.
+
+    Delegates to scripts/logreg_wald.R. With no clustering, performs a
+    classical likelihood-ratio test comparing the restricted model
+    (intercept + first n_force_keep features) to the full model (intercept +
+    all features). With clustering, falls back to a cluster-robust (sandwich)
+    Wald test on the joint nullity of the concept coefficients, which tests
+    the same null and is valid under clustered dependence.
+
+    @param features: n_obs x (n_force_keep + n_concepts) feature matrix.
+    @param y: binary outcome vector.
+    @param feature_definitions: ordered column descriptions (length == p).
+    @param n_force_keep: number of leading columns treated as force-keep.
+    @param cluster_ids: optional cluster labels aligned with rows of features.
+
+    Returns a one-row DataFrame summarizing the test.
+    """
+    features = pd.DataFrame(features)
+    assert len(feature_definitions) == features.shape[1]
+    n_total = features.shape[1]
+    n_concepts = n_total - n_force_keep
+    assert n_concepts > 0, "need at least one concept feature for the test"
+
+    # with tempfile.TemporaryDirectory() as tmp:
+    tmp = "_output"
+    in_csv = os.path.join(tmp, "features.csv")
+    out_csv = os.path.join(tmp, "wald.csv")
+    _write_features_csv(features, y, cluster_ids, in_csv)
+    rargs = [
+        "--in", in_csv,
+        "--out", out_csv,
+        "--n-force-keep", str(n_force_keep),
+    ]
+    if cluster_ids is not None:
+        rargs += ["--cluster-col", "__cluster__"]
+    _run_rscript(R_LOGREG_WALD, rargs)
+    out = pd.read_csv(out_csv)
+
+    logging.info("Concept-signal test:\n%s", out.to_string(index=False))
+    print(out.to_string(index=False))
+    return out
+
+
+def test_auc_difference(y, p_full, p_restr, cluster_ids=None, n_boot=1000,
+                        seed=0):
+    """Paired AUC test on precomputed predictions.
+
+    Delegates to scripts/logreg_auc_test.R. Compares `p_full` and `p_restr`
+    (predicted probabilities for the same observations) via DeLong's paired
+    ROC test. When cluster_ids is provided, additionally runs a cluster
+    bootstrap over (y, p_full, p_restr) triples for a cluster-robust CI and
+    p-value on the AUC difference.
+
+    @param y: binary outcome vector.
+    @param p_full: predicted probabilities from the full model (e.g. the
+        Bayesian ensemble).
+    @param p_restr: predicted probabilities from the restricted/baseline
+        model (e.g. a logistic regression on force-keep features only).
+    @param cluster_ids: optional cluster labels aligned with rows.
+    @param n_boot: number of cluster bootstrap replicates (ignored when
+        cluster_ids is None).
+    @param seed: RNG seed for the cluster bootstrap.
+
+    Returns a one-row DataFrame summarizing the test.
+    """
+    y = np.asarray(y).astype(int)
+    p_full = np.asarray(p_full).astype(float)
+    p_restr = np.asarray(p_restr).astype(float)
+    assert y.shape == p_full.shape == p_restr.shape, (
+        f"y, p_full, p_restr must have matching shapes; got "
+        f"{y.shape}, {p_full.shape}, {p_restr.shape}"
+    )
+
+    df = pd.DataFrame({"y": y, "p_full": p_full, "p_restr": p_restr})
+    if cluster_ids is not None:
+        df["__cluster__"] = np.asarray(cluster_ids)
+
+    tmp = "_output"
+    in_csv = os.path.join(tmp, "auc_test_preds.csv")
+    out_csv = os.path.join(tmp, "auc_test.csv")
+    df.to_csv(in_csv, index=False)
+    rargs = [
+        "--in", in_csv,
+        "--out", out_csv,
+        "--n-boot", str(n_boot),
+        "--seed", str(seed),
+    ]
+    if cluster_ids is not None:
+        rargs += ["--cluster-col", "__cluster__"]
+    _run_rscript(R_LOGREG_AUC_TEST, rargs)
+    out = pd.read_csv(out_csv)
+
+    logging.info("Paired AUC test:\n%s", out.to_string(index=False))
+    print(out.to_string(index=False))
+    return out
 
 
 def main(args):
@@ -344,11 +479,105 @@ def main(args):
     logging.info("===UNPENALIZED LOGREG===")
     force_keep = list(history.force_keep_cols) if history.force_keep_cols is not None else []
     feature_definitions = force_keep + [cd["concept"] for cd in concept_dicts]
-    coef_df = fit_unpenalized_logreg(extracted_features, y_test, feature_definitions)
+    cluster_ids = None
+    if args.cluster_column is not None:
+        if args.cluster_column not in test_data_df.columns:
+            raise ValueError(
+                f"--cluster-column {args.cluster_column!r} not in test data; "
+                f"available columns include {list(test_data_df.columns)[:20]}"
+            )
+        cluster_ids = test_data_df[args.cluster_column].to_numpy()
+        assert len(cluster_ids) == extracted_features.shape[0], (
+            f"cluster id length {len(cluster_ids)} does not match "
+            f"n_obs {extracted_features.shape[0]}"
+        )
+
+    # Drop collinear / redundant columns (e.g. one level of a one-hot encoding
+    # to serve as the reference). Match --drop-col values against
+    # feature_definitions; columns are dropped from both the force-keep
+    # prefix and the concept suffix as needed, and n_force_keep for the
+    # concept-signal test is reduced to reflect any dropped force-keep cols.
+    drop_names = list(args.drop_cols) if args.drop_cols else []
+    n_force_keep = len(force_keep)
+    if drop_names:
+        keep_mask = np.ones(len(feature_definitions), dtype=bool)
+        for name in drop_names:
+            matches = [i for i, d in enumerate(feature_definitions) if d == name]
+            # if not matches:
+            #     raise ValueError(
+            #         f"--drop-col {name!r} does not match any feature "
+            #         f"definition. force_keep={force_keep}, "
+            #         f"first few concepts={feature_definitions[len(force_keep):][:5]}"
+            #     )
+            for i in matches:
+                keep_mask[i] = False
+                if i < n_force_keep:
+                    n_force_keep -= 1
+        logging.info("Dropping columns %s (indices %s)", drop_names,
+                     np.where(~keep_mask)[0].tolist())
+        extracted_features = np.asarray(extracted_features)[:, keep_mask]
+        feature_definitions = [
+            d for d, k in zip(feature_definitions, keep_mask) if k
+        ]
+
+    coef_df = fit_unpenalized_logreg(
+        extracted_features, y_test, feature_definitions,
+        cluster_ids=cluster_ids,
+    )
     coef_df['method'] = args.method_name
     coef_df['seed'] = args.seed
+    coef_df['cluster_column'] = args.cluster_column
     coef_csv_file = os.path.splitext(args.result_csv_file)[0] + "_logreg_coefs.csv"
     coef_df.to_csv(coef_csv_file, index=False)
+
+    # If force-keep columns were used during training, compare the full model
+    # against a restricted model containing only those columns to see whether
+    # the learned concepts carry signal beyond the force-keep baseline.
+    if n_force_keep > 0:
+        logging.info("===CONCEPT-SIGNAL TEST===")
+        test_df = test_concepts_add_signal(
+            extracted_features, y_test, feature_definitions,
+            n_force_keep=n_force_keep,
+            cluster_ids=cluster_ids,
+        )
+        test_df['method'] = args.method_name
+        test_df['seed'] = args.seed
+        test_df['cluster_column'] = args.cluster_column
+        test_csv_file = os.path.splitext(args.result_csv_file)[0] + "_concept_signal_test.csv"
+        test_df.to_csv(test_csv_file, index=False)
+
+        logging.info("===PAIRED AUC TEST===")
+        # Full model: predictions from the Bayesian ensemble (positive class).
+        # Restricted model: unpenalized logistic regression trained on the
+        # training partition using only the force-keep columns, then applied
+        # to the test partition. Fitting on train (not test) avoids giving
+        # the baseline an in-sample advantage over the ensemble.
+        force_keep_names = feature_definitions[:n_force_keep - 2]
+        args.partition = "train"
+        train_data_df = load_data_partition(args)
+        print(train_data_df.columns)
+        print("force_keep_names", force_keep_names)
+        args.partition = "test"
+        X_restr_train = train_data_df[force_keep_names].to_numpy()
+        y_restr_train = train_data_df['y'].to_numpy().astype(int)
+        X_restr_test = test_data_df[force_keep_names].to_numpy()
+        restr_model = LogisticRegression(penalty=None, max_iter=1000)
+        restr_model.fit(X_restr_train, y_restr_train)
+        p_restr_test = restr_model.predict_proba(X_restr_test)[:, 1]
+        p_full_test = posterior_pred_prob[:, 1]
+
+        auc_df = test_auc_difference(
+            y=y_test,
+            p_full=p_full_test,
+            p_restr=p_restr_test,
+            cluster_ids=cluster_ids,
+            seed=args.seed,
+        )
+        auc_df['method'] = args.method_name
+        auc_df['seed'] = args.seed
+        auc_df['cluster_column'] = args.cluster_column
+        auc_csv_file = os.path.splitext(args.result_csv_file)[0] + "_auc_test.csv"
+        auc_df.to_csv(auc_csv_file, index=False)
 
     with open(args.out_extractions, "wb") as f:
         pickle.dump(all_extracted_features_dict, f)
