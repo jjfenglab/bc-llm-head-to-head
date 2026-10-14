@@ -21,8 +21,6 @@ from sklearn.calibration import CalibrationDisplay
 from sklearn.calibration import calibration_curve
 
 R_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-R_LOGREG_COEFS = os.path.join(R_SCRIPT_DIR, "logreg_coefs.R")
-R_LOGREG_WALD = os.path.join(R_SCRIPT_DIR, "logreg_wald.R")
 R_LOGREG_AUC_TEST = os.path.join(R_SCRIPT_DIR, "logreg_auc_test.R")
 
 sys.path.append(os.getcwd())
@@ -291,50 +289,6 @@ def fit_unpenalized_logreg(features, y, feature_definitions,
     return coef_df
 
 
-def test_concepts_add_signal(features, y, feature_definitions, n_force_keep,
-                             cluster_ids=None):
-    """Test whether concept features add signal beyond the force-keep features.
-
-    Delegates to scripts/logreg_wald.R. With no clustering, performs a
-    classical likelihood-ratio test comparing the restricted model
-    (intercept + first n_force_keep features) to the full model (intercept +
-    all features). With clustering, falls back to a cluster-robust (sandwich)
-    Wald test on the joint nullity of the concept coefficients, which tests
-    the same null and is valid under clustered dependence.
-
-    @param features: n_obs x (n_force_keep + n_concepts) feature matrix.
-    @param y: binary outcome vector.
-    @param feature_definitions: ordered column descriptions (length == p).
-    @param n_force_keep: number of leading columns treated as force-keep.
-    @param cluster_ids: optional cluster labels aligned with rows of features.
-
-    Returns a one-row DataFrame summarizing the test.
-    """
-    features = pd.DataFrame(features)
-    assert len(feature_definitions) == features.shape[1]
-    n_total = features.shape[1]
-    n_concepts = n_total - n_force_keep
-    assert n_concepts > 0, "need at least one concept feature for the test"
-
-    # with tempfile.TemporaryDirectory() as tmp:
-    tmp = "_output"
-    in_csv = os.path.join(tmp, "features.csv")
-    out_csv = os.path.join(tmp, "wald.csv")
-    _write_features_csv(features, y, cluster_ids, in_csv)
-    rargs = [
-        "--in", in_csv,
-        "--out", out_csv,
-        "--n-force-keep", str(n_force_keep),
-    ]
-    if cluster_ids is not None:
-        rargs += ["--cluster-col", "__cluster__"]
-    _run_rscript(R_LOGREG_WALD, rargs)
-    out = pd.read_csv(out_csv)
-
-    logging.info("Concept-signal test:\n%s", out.to_string(index=False))
-    print(out.to_string(index=False))
-    return out
-
 
 def test_auc_difference(y, p_full, p_restr, cluster_ids=None, n_boot=1000,
                         seed=0):
@@ -520,32 +474,10 @@ def main(args):
             d for d, k in zip(feature_definitions, keep_mask) if k
         ]
 
-    coef_df = fit_unpenalized_logreg(
-        extracted_features, y_test, feature_definitions,
-        cluster_ids=cluster_ids,
-    )
-    coef_df['method'] = args.method_name
-    coef_df['seed'] = args.seed
-    coef_df['cluster_column'] = args.cluster_column
-    coef_csv_file = os.path.splitext(args.result_csv_file)[0] + "_logreg_coefs.csv"
-    coef_df.to_csv(coef_csv_file, index=False)
-
     # If force-keep columns were used during training, compare the full model
     # against a restricted model containing only those columns to see whether
     # the learned concepts carry signal beyond the force-keep baseline.
     if n_force_keep > 0:
-        logging.info("===CONCEPT-SIGNAL TEST===")
-        test_df = test_concepts_add_signal(
-            extracted_features, y_test, feature_definitions,
-            n_force_keep=n_force_keep,
-            cluster_ids=cluster_ids,
-        )
-        test_df['method'] = args.method_name
-        test_df['seed'] = args.seed
-        test_df['cluster_column'] = args.cluster_column
-        test_csv_file = os.path.splitext(args.result_csv_file)[0] + "_concept_signal_test.csv"
-        test_df.to_csv(test_csv_file, index=False)
-
         logging.info("===PAIRED AUC TEST===")
         # Full model: predictions from the Bayesian ensemble (positive class).
         # Restricted model: unpenalized logistic regression trained on the
