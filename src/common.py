@@ -18,9 +18,7 @@ from src.logistic import LogisticRegressionTorch
 from src.utils import convert_to_json
 from src.llm_response_types import ExtractResponseList, GroupedExtractResponses
 
-sys.path.append('llm-api-main')
-from lab_llm.llm_api import LLMApi
-from lab_llm.dataset import TextDataset, ImageDataset, ImageGroupDataset
+from src.llm_utils import LLMApi, TextDataset, ImageDataset, ImageGroupDataset
 
 TABULAR_PREFIX = "Tabular feature: "
 
@@ -147,7 +145,7 @@ def train_LR(X_train, y_train, penalty=None, use_acc:bool=False, seed:int = 0) -
         "n_jobs": -1,
     }
     
-    if penalty is None:
+    if penalty is None or penalty == "None":
         final_model = LogisticRegression(penalty=None)
         final_model.fit(X_train, y_train)
     elif penalty == "l1":
@@ -263,6 +261,7 @@ def extract_features_by_llm_grouped(
                     temperature=0,
                     max_retries=max_retries,
                     response_model=GroupedExtractResponses,
+                    thinking={"type": "disabled"},
                 )
             )
             print("grouped_llm_outputs", len(grouped_llm_outputs), dset_train.shape[0])
@@ -298,6 +297,7 @@ def extract_features_by_llm_grouped(
                     temperature=0,
                     max_retries=max_retries,
                     response_model=ExtractResponseList,
+                    thinking={"type": "disabled"},
                 )
             )
 
@@ -312,8 +312,12 @@ def extract_features_by_llm_grouped(
         # fill in dictionary with extractions        
         for idx, concept in enumerate(batch_concepts_to_extract):
             extracted_features = extracted_llm_outputs[:, idx:idx + 1]
-            logging.info("concept %s, prevalence %f",
-                        concept, np.mean(extracted_features))
+            logging.info("concept %s, non-zero prevalence %f, prevalence=1 %f, prevalence=-1 %f",
+                        concept,
+                        np.mean(extracted_features != 0),
+                        np.mean(extracted_features == 1),
+                        np.mean(extracted_features == -1),
+                        )
             all_extracted_features_dict[concept] = extracted_features
 
         if extraction_file is not None:

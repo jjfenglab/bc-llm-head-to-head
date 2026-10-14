@@ -16,16 +16,12 @@ from matplotlib import pyplot as plt
 import re
 
 sys.path.append(os.getcwd())
-sys.path.append('llm-api-main')
 
-from lab_llm.llm_api import LLMApi
+from src.llm_utils import LLMApi
 from src.utils import convert_to_json
 import src.common as common
 from src.training_history import TrainingHistory
 from scripts.train_bayesian import load_data_partition, load_llms
-from lab_llm.error_callback_handler import ErrorCallbackHandler
-from lab_llm.duckdb_handler import DuckDBHandler
-from lab_llm.llm_cache import LLMCache
 
 def parse_args(args):
     """parse command line arguments"""
@@ -214,7 +210,6 @@ def main(args):
                         filename=args.log_file, level=logging.INFO)
     logging.info(args)
     np.random.seed(args.seed)
-    args.cache = LLMCache(DuckDBHandler(args.cache_file))
 
     history = TrainingHistory(force_keep_cols=args.keep_x_cols)
 

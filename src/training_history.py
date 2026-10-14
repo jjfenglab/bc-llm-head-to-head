@@ -13,7 +13,13 @@ class TrainingHistory:
         self._coefs = []
         self._intercepts = []
         self._log_liks = []
-    
+        self._completed_epochs = 0
+
+    def __setstate__(self, state):
+        # Default _completed_epochs for pickles saved before this field existed.
+        state.setdefault("_completed_epochs", 0)
+        self.__dict__.update(state)
+
     @property
     def num_iters(self):
         return len(self._concepts)
@@ -33,14 +39,12 @@ class TrainingHistory:
         else:
             return None
 
-    def load(self, file_name: str):
-        if os.path.exists(file_name):
-            with open(file_name, 'rb') as file:
-                self = pickle.load(file)
-        else:
-            raise FileNotFoundError("FILE?", file_name)
-                
-        return self
+    @classmethod
+    def load(cls, file_name: str) -> "TrainingHistory":
+        if not os.path.exists(file_name):
+            raise FileNotFoundError(file_name)
+        with open(file_name, 'rb') as file:
+            return pickle.load(file)
 
     def add_auc(self, auc: float):
         self._aucs.append(auc)

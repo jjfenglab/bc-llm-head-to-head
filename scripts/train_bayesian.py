@@ -21,13 +21,7 @@ from sklearn.model_selection import train_test_split
 
 sys.path.append(os.getcwd())
 from src.concept_learner_model import ConceptLearnerModel
-
-sys.path.append('llm-api-main/lab_llm')
-from lab_llm.constants import LLMModel, OpenAi, convert_to_llm_type
-from lab_llm.llm_api import LLMApi
-from lab_llm.llm_cache import LLMCache
-from lab_llm.duckdb_handler import DuckDBHandler
-from lab_llm.error_callback_handler import ErrorCallbackHandler
+from src.llm_utils import LLMApi, create_llm_clients
 from src.training_history import TrainingHistory
 import src.common as common
 
@@ -86,12 +80,19 @@ def parse_args(args):
             "--llm-extraction-type",
             type=str,
             )
+    parser.add_argument(
+            "--cluster-column",
+            type=str,
+            default=None,
+            help="Column in the input CSV whose values define cluster IDs; "
+                 "rows sharing a cluster ID are kept in the same partial-posterior "
+                 "split (needed when the data contains augmented symmetric siblings).",
+            )
     args = parser.parse_args()
     args.partition = "train"
     assert args.use_api
     args.count_vectorizer, args.residual_model_type = args.learner_type.split("_")
     args.keep_x_cols = pd.Series(args.keep_x_cols) if args.keep_x_cols is not None else None
-    args.cache = DuckDBHandler(args.cache_file)
     return args
 
 def load_data_partition(args, init_concepts_file=None, text_summary_column: str = "llm_output"):
@@ -166,30 +167,15 @@ def get_word_count_data(
 
 def load_llms(args) -> dict[str, LLMApi]:
     assert args.cache_file is not None
-    
-    logger = logging.getLogger(__name__)
     load_dotenv()
-    cache = LLMCache(DuckDBHandler(args.cache_file))
-    if args.llm_model_type is not None:
-        args.llm_model_type = convert_to_llm_type(args.llm_model_type)
-    if args.llm_iter_type is not None:
-        args.llm_iter_type = convert_to_llm_type(args.llm_iter_type)
-    if args.llm_extraction_type is not None:
-        args.llm_extraction_type = convert_to_llm_type(args.llm_extraction_type)
-
-    if args.llm_model_type:
-        llm = LLMApi(cache, seed=10, model_type=args.llm_model_type, error_handler=ErrorCallbackHandler(logger), logging=logging, timeout=120)
-        return {
-            "iter": llm,
-            "extraction": llm
-        }
-    else:
-        llm_iter = LLMApi(cache, seed=10, model_type=args.llm_iter_type, error_handler=ErrorCallbackHandler(logger), logging=logging)
-        llm_extraction = LLMApi(cache, seed=10, model_type=args.llm_extraction_type, error_handler=ErrorCallbackHandler(logger), logging=logging)
-        return {
-            "iter": llm_iter,
-            "extraction": llm_extraction
-        }
+    logger = logging.getLogger(__name__)
+    return create_llm_clients(
+        cache_file=args.cache_file,
+        llm_model=args.llm_model_type,
+        llm_iter_model=args.llm_iter_type,
+        llm_extraction_model=args.llm_extraction_type,
+        logger=logger,
+    )
 
 def main(args):
     args = parse_args(args)
@@ -245,6 +231,7 @@ def main(args):
         force_keep_columns=args.keep_x_cols,
         num_top=args.num_top_residual_words,
         max_new_tokens=args.max_new_tokens,
+        cluster_column=args.cluster_column,
     )
     bayesian_cbm.fit(
         data_df,

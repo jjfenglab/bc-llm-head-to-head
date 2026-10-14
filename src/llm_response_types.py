@@ -47,7 +47,7 @@ class CandidateConcepts(BaseModel):
 
 class ExtractResponse(BaseModel):
     question: int = Field(..., description="question number")
-    reasoning: Optional[str] = Field(description="reasoning")
+    reasoning: Optional[str] = Field(default=None, description="reasoning")
     answer: float = Field(..., description="binary answer, 1=yes, 0=no, probability if unsure")
 
     @field_validator('question', mode="before")
@@ -55,7 +55,7 @@ class ExtractResponse(BaseModel):
         return int(value)
 
 class ExtractResponseList(BaseModel):
-    reasoning: Optional[str] = Field(description="reasoning")
+    reasoning: Optional[str] = Field(default=None, description="reasoning")
     extractions: List[ExtractResponse] = Field(..., description="List of extractions")
 
 class GroupedExtractResponses(BaseModel):

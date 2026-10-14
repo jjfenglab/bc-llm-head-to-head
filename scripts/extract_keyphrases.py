@@ -26,13 +26,7 @@ from src.utils import convert_to_json
 from src.llm_response_types import ProtoConceptExtract
 import src.common as common
 
-sys.path.append('llm-api-main')
-from lab_llm.constants import LLMModel, OpenAi, convert_to_llm_type
-from lab_llm.llm_api import LLMApi
-from lab_llm.llm_cache import LLMCache
-from lab_llm.duckdb_handler import DuckDBHandler
-from lab_llm.error_callback_handler import ErrorCallbackHandler
-from lab_llm.dataset import TextDataset, ImageDataset
+from src.llm_utils import LLMApi, TextDataset, ImageDataset
 
 
 def parse_args(args):
@@ -102,12 +96,10 @@ def main(args):
         for k, v in config_dict.items():
             prompt_template = prompt_template.replace(k, v)
     
-    # Setup LLM cache + API
+    # Setup LLM
     logger = logging.getLogger(__name__)
     load_dotenv()
-    args.cache = LLMCache(DuckDBHandler(args.cache_file))
-    args.llm_model_type = convert_to_llm_type(args.llm_model_type)
-    llm = LLMApi(args.cache, seed=10, model_type=args.llm_model_type, error_handler=ErrorCallbackHandler(logger), logging=logging)
+    llm = LLMApi(args.llm_model_type, cache_file=args.cache_file, logger=logger)
 
     if args.batch_obs_size > 1:
         # Get outputs grouped
@@ -173,14 +165,16 @@ def main(args):
         llm_reasoning_strs = [""] * len(missing_idxs)
         for grp_id in np.unique(group_ids):
             match_idxs = np.where(group_ids == grp_id)[0]
+            if any([llm_outputs[match_idx] is None for match_idx in match_idxs]):
+                continue
             grp_llm_output = ','.join(
                 [",".join(llm_outputs[match_idx].keyphrases) for match_idx in match_idxs]
             )
             llm_output_strs[grp_id] = grp_llm_output
             llm_reasoning_strs[grp_id] = llm_outputs[match_idxs[0]].reasoning
     
-    data_df["llm_output"].iloc[missing_idxs] = llm_output_strs
-    data_df["llm_reasoning"].iloc[missing_idxs] = llm_reasoning_strs
+    data_df.loc[missing_idxs, "llm_output"] = llm_output_strs
+    data_df.loc[missing_idxs, "llm_reasoning"] = llm_reasoning_strs
     print("not na", (data_df.llm_output != "").sum())
     data_df.to_csv(args.llm_outputs_file, index=False)
 

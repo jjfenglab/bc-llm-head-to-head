@@ -1,0 +1,334 @@
+"""
+End-to-end BC-LLM trainer: proposes an initial concept set from top word
+features (what train_baseline.py did), then runs Bayesian MH iterations
+over the concept set (what train_bayesian.py did).
+
+Collapses the previous two-step pipeline into a single entry point. CLI
+flags are the union of the two originals; shared helpers are reused via
+imports rather than copied.
+"""
+
+import argparse
+import logging
+import os
+import pickle
+import sys
+
+import numpy as np
+import pandas as pd
+import torch
+from dotenv import load_dotenv
+
+sys.path.append(os.getcwd())
+from src.concept_learner_model import ConceptLearnerModel, CandidateConcepts
+from src.llm_utils import LLMApi, create_llm_clients
+from src.training_history import TrainingHistory
+import src.common as common
+from src.bertopic_features import SignedBertopicModel
+from scripts.train_bayesian import load_data_partition, get_word_count_data, load_llms
+from scripts.train_baseline import generate_prior_prompt
+
+
+def parse_args(args):
+    parser = argparse.ArgumentParser(description=__doc__)
+    # Data
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--in-dataset-file", type=str, required=True,
+                        help="csv of the labelled training data")
+    parser.add_argument("--indices-csv", type=str, required=True,
+                        help="csv of training indices (partition column)")
+    parser.add_argument("--init-concepts-file", type=str, default=None,
+                        help="optional precomputed LLM-extracted keyphrases to seed llm_output")
+    parser.add_argument("--text-summary-column", type=str, default="llm_output",
+                        choices=['llm_output', 'sentence', 'spacy_output'])
+    parser.add_argument("--keep-x-cols", type=str, nargs="*",
+                        help="tabular columns to force keep")
+    parser.add_argument("--max-obs", type=int, default=0)
+    parser.add_argument("--min-prevalence", type=float, default=0.01)
+    parser.add_argument("--cluster-column", type=str, default=None,
+                        help="Column whose values define cluster IDs; rows sharing a "
+                             "value are kept in the same partial-posterior split "
+                             "(needed for augmented symmetric pairs).")
+    # LLM
+    parser.add_argument("--use-api", action="store_true")
+    parser.add_argument("--cache-file", type=str, default="cache.db")
+    parser.add_argument("--llm-model-type", type=str)
+    parser.add_argument("--llm-iter-type", type=str)
+    parser.add_argument("--llm-extraction-type", type=str)
+    # Baseline-init step
+    parser.add_argument("--baseline-init-file", type=str, required=True,
+                        help="prompt template for generating the initial concept set")
+    parser.add_argument("--num-top-attributes", type=int, default=20,
+                        help="number of top words to show the LLM when proposing init concepts")
+    parser.add_argument("--use-acc", action="store_true",
+                        help="rank top words by accuracy rather than AUC")
+    parser.add_argument("--use-bertopic", action="store_true",
+                        help="cluster keyphrases into BERTopic topics (partitioned by A>B / B>A) "
+                             "and use topic presence/absence as init features instead of raw keyphrases")
+    parser.add_argument("--bertopic-nr-topics", type=int, default=100,
+                        help="target topic count per sign partition (A>B and B>A each)")
+    parser.add_argument("--bertopic-embedding-model", type=str, default="all-MiniLM-L6-v2",
+                        help="sentence-transformers model used to embed keyphrases for BERTopic")
+    parser.add_argument("--bertopic-top-k-phrases", type=int, default=3,
+                        help="max number of representative keyphrases to list per topic in the init prompt")
+    parser.add_argument("--bertopic-init-file", type=str, default=None,
+                        help="prompt template for the BERTopic init path "
+                             "(uses {top_topics_text} + {num_meta_concepts}); "
+                             "required when --use-bertopic is set")
+    parser.add_argument("--bertopic-iter-file", type=str, default=None,
+                        help="prompt template for the BERTopic MH iteration path "
+                             "(uses {top_topics_text}, {meta_concepts}, {num_concepts}, "
+                             "{num_concepts_fixed}); required when --use-bertopic is set")
+    parser.add_argument("--max-tokens", type=int, default=10000,
+                        help="max_new_tokens for the init-concepts LLM call")
+    parser.add_argument("--config-file", type=str,
+                        help="json of substitutions to apply to the init prompt")
+    # Bayesian MH step
+    parser.add_argument("--num-meta-concepts", type=int, default=5)
+    parser.add_argument("--max-epochs", type=int, default=10)
+    parser.add_argument("--num-greedy-epochs", type=int, default=0)
+    parser.add_argument("--num-greedy-holdout", type=int, default=1)
+    parser.add_argument("--is-greedy-metric-acc", action="store_true", default=False)
+    parser.add_argument("--do-greedy", action="store_true", default=False)
+    parser.add_argument("--num-minibatch", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-concept-size", type=int, default=20)
+    parser.add_argument("--batch-obs-size", type=int, default=1)
+    parser.add_argument("--learner-type", type=str, default="count_l2",
+                        choices=['count_elasticnet', 'tfidf_l2', 'tfidf_l1',
+                                 'count_l2', 'count_l1', 'count_rf', 'count_None'])
+    parser.add_argument("--final-learner-type", type=str, default=None,
+                        choices=['l1', 'l2', None])
+    parser.add_argument("--inverse-penalty-param", type=int, default=20000)
+    parser.add_argument("--train-frac", type=float, default=0.5)
+    parser.add_argument("--prompt-iter-file", type=str, required=True)
+    parser.add_argument("--prompt-iter-type", type=str, default="conditional",
+                        choices=["marginal", "conditional", "error_obs", "error_obs_w_conditional"])
+    parser.add_argument("--prompt-concepts-file", type=str, required=True)
+    parser.add_argument("--prompt-prior-file", type=str, default=None)
+    parser.add_argument("--max-new-tokens", type=int, default=5000)
+    parser.add_argument("--num-top-residual-words", type=int, default=40)
+    parser.add_argument("--max-section-length", type=int, default=None)
+    parser.add_argument("--is-image", action="store_true", default=False)
+    # Outputs
+    parser.add_argument("--log-file", type=str, default="_output/log_train_bc_llm.txt")
+    parser.add_argument("--training-history-file", type=str, required=True)
+    parser.add_argument("--out-extractions-file", type=str,
+                        default="_output/note_extractions.pkl")
+    parser.add_argument("--aucs-plot-file", type=str, default="_output/aucs.png")
+
+    args = parser.parse_args()
+    assert args.use_api, "--use-api required (vLLM path not supported in this shim)"
+    args.partition = "train"
+    args.count_vectorizer, args.residual_model_type = args.learner_type.split("_")
+    # Baseline helper reads args.model (its own learner-type parse); mirror it.
+    args.model = args.residual_model_type if args.residual_model_type != "None" else None
+    args.keep_x_cols = pd.Series(args.keep_x_cols) if args.keep_x_cols is not None else None
+    return args
+
+
+def _build_bertopic_init_prompt(args, data_df, y, topic_feats) -> str:
+    """Rank already-built BERTopic topic features by |coef| and render list-of-lists."""
+    is_multiclass = np.unique(y).size > 2
+    X_keep = data_df[args.keep_x_cols].to_numpy() if args.keep_x_cols is not None else None
+    top_df = ConceptLearnerModel.fit_residual(
+        args.model,
+        topic_feats.feat_names.tolist(),
+        X_keep,
+        topic_feats.X,
+        y,
+        penalty_downweight_factor=100,
+        is_multiclass=is_multiclass,
+        num_top=args.num_top_attributes,
+        use_acc=args.use_acc,
+        seed=args.seed,
+    )
+    selected_names = top_df["feature_name"].tolist()
+    coefs = dict(zip(top_df["feature_name"].tolist(), top_df["coef"].tolist()))
+    top_topics_text = topic_feats.render_topics(
+        selected_names,
+        top_k_phrases=args.bertopic_top_k_phrases,
+        coefs=coefs,
+    )
+
+    assert args.bertopic_init_file is not None, (
+        "--bertopic-init-file is required when --use-bertopic is set"
+    )
+    with open(args.bertopic_init_file, "r") as f:
+        prompt_template = f.read()
+    prompt_template = prompt_template.replace("{top_topics_text}", top_topics_text)
+    prompt_template = prompt_template.replace(
+        "{num_meta_concepts}", str(args.num_meta_concepts)
+    )
+    if args.config_file is not None:
+        import json
+        with open(args.config_file, "r") as f:
+            for k, v in json.load(f).items():
+                prompt_template = prompt_template.replace(k, v)
+    return prompt_template
+
+
+def propose_initial_concepts(args, data_df, X_words, y, word_names, llm_dict, topic_feats=None) -> list[dict]:
+    """Baseline step: ask the LLM for an initial concept set.
+
+    Default path: fit a residual LR over the raw keyphrase vocabulary and show
+    the top keyphrases to the LLM. With --use-bertopic: cluster keyphrases
+    (A>B and B>A partitions clustered separately), rank topics by |coef|, and
+    show each as a list of its most frequent member keyphrases with counts.
+    """
+    if args.use_bertopic:
+        assert topic_feats is not None
+        init_prompt = _build_bertopic_init_prompt(args, data_df, y, topic_feats)
+    else:
+        init_prompt = generate_prior_prompt(
+            data_df,
+            X_words,
+            y,
+            word_names=word_names,
+            args=args,
+            num_top=args.num_top_attributes,
+            use_acc=args.use_acc,
+        )
+    logging.info("INIT LLM PROMPT %s", init_prompt)
+    candidate = llm_dict["iter"].get_output(
+        init_prompt,
+        max_new_tokens=args.max_tokens,
+        response_model=CandidateConcepts,
+    )
+    logging.info("INIT LLM RESPONSE %s", candidate)
+    return candidate.to_dicts()[: args.num_meta_concepts]
+
+
+def main(args):
+    args = parse_args(args)
+    os.makedirs(os.path.dirname(args.log_file) or ".", exist_ok=True)
+    logging.basicConfig(format="%(message)s", filename=args.log_file, level=logging.INFO)
+    logging.info(args)
+    load_dotenv()
+
+    # Load the training partition and word-level features (shared with both legacy scripts).
+    data_df = load_data_partition(
+        args,
+        init_concepts_file=args.init_concepts_file,
+        text_summary_column=args.text_summary_column,
+    )
+    X_features, feat_names = get_word_count_data(
+        data_df,
+        args.count_vectorizer,
+        args.text_summary_column,
+        min_prevalence=args.min_prevalence,
+    )
+    y_train = data_df["y"].to_numpy().flatten()
+    logging.info("data_df shape %s, X_features shape %s, num classes %d",
+                 data_df.shape, X_features.shape, np.unique(y_train).size)
+
+    # BERTopic mode: fit once over the full training keyphrase corpus. The
+    # same model is used to render the init prompt, as the residual-feature
+    # source for MH, and to produce rendered topic blocks in each MH prompt.
+    bertopic_model = None
+    topic_feats = None
+    if args.use_bertopic:
+        assert args.bertopic_iter_file is not None, (
+            "--bertopic-iter-file is required when --use-bertopic is set"
+        )
+        bertopic_model = SignedBertopicModel(
+            n_topics=args.bertopic_nr_topics,
+            seed=args.seed,
+            embedding_model=args.bertopic_embedding_model,
+        )
+        bertopic_model.partial_fit(data_df, args.text_summary_column)
+        topic_feats = bertopic_model.build_features(data_df, args.text_summary_column)
+        if topic_feats.X.shape[1] == 0:
+            raise RuntimeError("BERTopic produced zero non-noise topics")
+        logging.info("BERTopic features: shape=%s, n_topics=%d",
+                     topic_feats.X.shape, len(topic_feats.feat_names))
+
+    llm_dict = load_llms(args)
+
+    if os.path.exists(args.training_history_file):
+        history = TrainingHistory.load(args.training_history_file)
+        logging.info("Resuming from %s (%d completed epochs)",
+                     args.training_history_file, history._completed_epochs)
+        if os.path.exists(args.out_extractions_file):
+            with open(args.out_extractions_file, "rb") as f:
+                initial_extractions = pickle.load(f)
+            logging.info("Loaded %d cached extractions from %s",
+                         len(initial_extractions), args.out_extractions_file)
+        else:
+            initial_extractions = {}
+            logging.info("No extractions cache at %s; starting with empty cache",
+                         args.out_extractions_file)
+        # Diverge RNG from where a fresh run would be, so the MH chain doesn't
+        # retrace the same early draws it already made.
+        resume_seed = args.seed + history._completed_epochs
+        np.random.seed(resume_seed)
+        torch.manual_seed(resume_seed)
+    else:
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        # Step 1: propose initial concepts from the top-word residual model.
+        init_concepts = propose_initial_concepts(
+            args, data_df, X_features, y_train, feat_names, llm_dict,
+            topic_feats=topic_feats,
+        )
+        logging.info("initial concepts: %s", [c["concept"] for c in init_concepts])
+        history = TrainingHistory(args.keep_x_cols)
+        history.add_concepts(init_concepts)
+        initial_extractions = {}
+
+    # Step 2: MH iterations over the concept set, seeded with those initial concepts.
+    if bertopic_model is not None:
+        prompt_iter_file = args.bertopic_iter_file
+        X_for_mh = topic_feats.X
+        feat_names_for_mh = topic_feats.feat_names
+    else:
+        prompt_iter_file = args.prompt_iter_file
+        X_for_mh = X_features
+        feat_names_for_mh = feat_names
+    bayesian_cbm = ConceptLearnerModel(
+        init_history=history,
+        llm_iter=llm_dict["iter"],
+        llm_extraction=llm_dict["extraction"],
+        num_classes=np.unique(y_train).size,
+        num_minibatch=args.num_minibatch,
+        num_meta_concepts=args.num_meta_concepts,
+        prompt_iter_type=args.prompt_iter_type,
+        prompt_iter_file=prompt_iter_file,
+        config={},
+        prompt_concepts_file=args.prompt_concepts_file,
+        prompt_prior_file=args.prompt_prior_file,
+        out_extractions_file=args.out_extractions_file,
+        residual_model_type=args.residual_model_type,
+        final_learner_type=args.final_learner_type,
+        inverse_penalty_param=args.inverse_penalty_param,
+        train_frac=args.train_frac,
+        num_greedy_epochs=args.num_greedy_epochs,
+        num_greedy_holdout=args.num_greedy_holdout,
+        is_greedy_metric_acc=args.is_greedy_metric_acc,
+        max_epochs=args.max_epochs,
+        batch_size=args.batch_size,
+        batch_concept_size=args.batch_concept_size,
+        batch_obs_size=args.batch_obs_size,
+        do_greedy=args.do_greedy,
+        is_image=args.is_image,
+        all_extracted_features_dict={},
+        max_section_length=args.max_section_length,
+        force_keep_columns=args.keep_x_cols,
+        num_top=args.num_top_residual_words,
+        max_new_tokens=args.max_new_tokens,
+        cluster_column=args.cluster_column,
+        bertopic_model=bertopic_model,
+        bertopic_top_k_phrases=args.bertopic_top_k_phrases,
+    )
+    bayesian_cbm.fit(
+        data_df,
+        X_features=X_for_mh,
+        feat_names=feat_names_for_mh,
+        training_history_file=args.training_history_file,
+        aucs_plot_file=args.aucs_plot_file,
+        initial_extractions=initial_extractions,
+    )
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
